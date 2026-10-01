@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from . import drafts, materials
+from . import access, drafts, materials
 from .util import loads
 
 # 附件在正文中的引用形式：@attachment:<id>
@@ -27,6 +27,155 @@ def _issue(code: str, message: str, *, qid: str | None = None,
         d["qid"] = qid
     d.update(extra)
     return d
+
+
+def check_authz_at_finalize(conn, draft: dict, inquiry: dict) -> list[dict]:
+    """定稿前逐问按 *保存当时有效授权* 独立重验读取资格。
+
+    封存后的答复不因人员权限变化而改写——但定稿（封存）发生在当下，
+    必须确认每个章节修订与其引用、附件上传在作出时就具备读取资格；
+    后续纠正（更正件）必须按更正当时有效的授权重新检查（克隆继承的
+    修订 is_cloned=1，必须在更正底稿上重新保存）。
+
+    本函数刻意不复述任何资料原值或正文：越权项只列问题（qid）、章节
+    section_id 与被拒资料引用锚/附件 id。
+
+    原因码：
+      SAVE_AUTHZ_MISSING      托管问询中的章节保存缺少授权快照（旧/继承修订）
+      WRITER_NOT_MEMBER_AT_SAVE 保存时撰写人已不在组
+      NOT_ASSIGNED_AT_SAVE    保存时该撰写人未被分派到该问题
+      CITATION_NOT_AUTHORIZED 引用越出保存时的问题授权
+      ATTACHMENT_NOT_AUTHORIZED 附件上传/引用越出授权边界
+      PROTECTED_VALUE_USED    正文使用了未授权字段的原值
+    """
+    issues: list[dict] = []
+    inquiry_id = draft["inquiry_id"]
+    if not access.is_managed(conn, inquiry_id):
+        return issues
+
+    # section_id -> qid（克隆的 section_revisions 属于哪个问题）
+    sec_qid = {s["id"]: s["qid"] for s in draft["sections"]}
+    attach_by_id = {a["id"]: a for a in draft["attachments"]}
+
+    def add(code: str, message: str, *, qid, section_id=None, refs=None,
+            attachments=None, writer_key=None):
+        it = {"severity": "blocking", "code": code, "message": message,
+              "qid": qid}
+        if section_id:
+            it["section_id"] = section_id
+        if refs is not None:
+            it["denied_refs"] = refs
+        if attachments is not None:
+            it["denied_attachments"] = attachments
+        if writer_key is not None:
+            it["writer_key"] = writer_key
+        issues.append(it)
+
+    # ---- 1) 逐章节 *链头修订*（最终回答）：保存当时成员关系 / 分派 / 引用
+    # 资格 / 受保护原值。只审链头：定稿封存的是最终回答，历史中间修订
+    # （含从原提交件克隆的继承修订）不构成答复内容；但更正底稿若从未在
+    # 更正当时授权下重新保存，链头就仍是继承修订 -> 必须阻断。
+    for sec in draft["sections"]:
+        qid = sec["qid"]
+        sid = sec["id"]
+        head = conn.execute(
+            "SELECT * FROM section_revisions WHERE section_id=? "
+            "ORDER BY revision DESC LIMIT 1", (sid,)).fetchone()
+        if head is None:
+            continue
+        rv = dict(head)
+        ar = rv["auth_revision"]
+        writer = rv["writer_key"]
+        if rv["is_cloned"] or ar is None or writer is None:
+            if draft["kind"] == "CORRECTION":
+                add("SAVE_AUTHZ_MISSING",
+                    f"问题 {qid} 的更正回答沿用了封存前的继承修订"
+                    f"（rev={rv['revision']}），必须按更正当时有效的授权"
+                    "重新撰写保存", qid=qid, section_id=sid)
+            else:
+                add("SAVE_AUTHZ_MISSING",
+                    f"问题 {qid} 的最终修订 rev={rv['revision']} 缺少授权快照，"
+                    "托管问询中必须在当前授权下保存",
+                    qid=qid, section_id=sid)
+            continue
+        member = access.member_at(conn, inquiry_id, writer, ar)
+        if member is None:
+            add("WRITER_NOT_MEMBER_AT_SAVE",
+                f"问题 {qid} 最终修订 rev={rv['revision']} 的撰写人在保存当时"
+                "已不在组", qid=qid, section_id=sid, writer_key=writer)
+            continue
+        if member["role"] != access.ROLE_OWNER:
+            grant = access.grant_at(conn, inquiry_id, qid, ar)
+            if grant is None or writer not in grant["writers"]:
+                add("NOT_ASSIGNED_AT_SAVE",
+                    f"问题 {qid} 最终修订 rev={rv['revision']} 的撰写人在保存"
+                    "当时未被分派到该问题",
+                    qid=qid, section_id=sid, writer_key=writer)
+                continue
+            refs = sorted({f"{c['prefix']}:{c['material_id']}@{c['version']}"
+                           for c in drafts.extract_citations(
+                               rv["body"] + "\n" + rv["title"])
+                           if c["version"]})
+            denied = access.check_refs_allowed(grant, refs, conn)
+            if denied:
+                add("CITATION_NOT_AUTHORIZED",
+                    f"问题 {qid} 最终修订 rev={rv['revision']} 含保存时未获"
+                    "授权的引用", qid=qid, section_id=sid, refs=denied,
+                    writer_key=writer)
+            for aid in _extract_attach_refs(rv["body"]):
+                att = attach_by_id.get(aid)
+                if att is None:
+                    continue  # 不存在由 ATTACHMENT_REF_MISSING 处理
+                ref = att.get("derived_from_ref")
+                mat = access._material_row_for_ref(conn, ref) if ref else None
+                if att.get("qid") != qid or not (
+                        mat and access.grant_allows_material(grant, mat)):
+                    add("ATTACHMENT_NOT_AUTHORIZED",
+                        f"问题 {qid} 最终修订 rev={rv['revision']} 引用了未"
+                        "授权附件", qid=qid, section_id=sid,
+                        attachments=[aid], writer_key=writer)
+            # 只在“被引用且授权内”的资料上扫描未授权字段原值
+            allowed_refs = {r for r in refs if r not in set(denied)}
+            hits = access.scan_protected_values(
+                conn, draft, grant, rv["body"] + "\n" + rv["title"],
+                refs=allowed_refs)
+            if hits:
+                add("PROTECTED_VALUE_USED",
+                    f"问题 {qid} 最终修订 rev={rv['revision']} 使用了未授权"
+                    "字段的原值（只列字段与来源锚）",
+                    qid=qid, section_id=sid,
+                    refs=sorted({h["ref"] for h in hits}),
+                    writer_key=writer)
+
+    # ---- 2) 附件上传当时的资格（与引用独立：存在即必须有合法上传授权） ----
+    for a in draft["attachments"]:
+        ar = a.get("auth_revision")
+        writer = a.get("writer_key")
+        qid = a.get("qid")
+        if a.get("is_cloned"):
+            # 克隆附件本身不可变、内容不重传；它被某章节引用时引用资格已在
+            # 上面按章节修订核验。更正底稿中的克隆附件不再单独要求重传授权。
+            continue
+        if ar is None or writer is None:
+            continue  # 非托管或由旧路径上传；托管下章节引用核验会兜底
+        member = access.member_at(conn, inquiry_id, writer, ar)
+        if member is None:
+            add("WRITER_NOT_MEMBER_AT_SAVE",
+                "附件上传者在上传当时已不在组", qid=qid,
+                attachments=[a["id"]], writer_key=writer)
+            continue
+        if member["role"] == access.ROLE_OWNER:
+            continue
+        grant = access.grant_at(conn, inquiry_id, qid, ar) if qid else None
+        ref = a.get("derived_from_ref")
+        mat = access._material_row_for_ref(conn, ref) if ref else None
+        if not (grant and writer in grant["writers"]
+                and mat and access.grant_allows_material(grant, mat)):
+            add("ATTACHMENT_NOT_AUTHORIZED",
+                "附件上传越出当时的问题授权边界", qid=qid,
+                attachments=[a["id"]], refs=[ref] if ref else [],
+                writer_key=writer)
+    return issues
 
 
 def check_drift(conn, draft: dict) -> list[dict]:
@@ -144,6 +293,12 @@ def build_report(conn, draft_id: str) -> dict:
                                fact_key=c["fact_key"], ref_a=c["ref_a"],
                                ref_b=c["ref_b"]))
 
+    # 1b) 分区写作/最小披露：逐问按保存当时有效授权独立重验读取资格
+    # （只列问题/章节/被拒资料锚与附件 id，绝不回显受保护内容）。
+    authz_issues = check_authz_at_finalize(conn, draft, inquiry)
+    for it in authz_issues:
+        blocking.append(it)
+
     # 2) 逐问题：唯一章节 / 非空回答 / 引用全部锁定且版本一致 / 敏感合规
     for q in inquiry["questions"]:
         qid = q["qid"]
@@ -251,6 +406,16 @@ def build_report(conn, draft_id: str) -> dict:
             blocking.append(_issue("ORPHAN_SECTION",
                                    f"章节 {s['qid']} 不对应问询清单中的任何问题",
                                    qid=s["qid"]))
+
+    # 4b) 授权越权项归入逐问视图与未满足清单（不回显受保护值）
+    for it in authz_issues:
+        qid = it.get("qid")
+        pq = per_question.setdefault(qid, {"qid": qid, "issues": []})
+        pq["issues"].append(it)
+        unsatisfied.append({"qid": qid, "code": it["code"],
+                            "message": it["message"],
+                            "denied_refs": it.get("denied_refs"),
+                            "denied_attachments": it.get("denied_attachments")})
 
     # 5) 漂移 / 截止时间 警告（非阻断）
     warnings.extend(check_drift(conn, draft))

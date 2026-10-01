@@ -150,24 +150,38 @@ class InquiryOrchestrator:
     # =======================================================================
     def submit_section(self, draft_id: str, qid: str, body: str, *,
                        expected_revision: int, title: str = "",
-                       submitted_by: str | None = None) -> dict:
+                       submitted_by: str | None = None,
+                       expected_auth_revision: int | None = None) -> dict:
         """乐观并发提交。
 
         过期提交不覆盖新内容；冲突留痕在独立事务中保留（业务事务回滚不影响
         留痕），随后把 STALE_REVISION 抛给调用方。
+
+        托管问询下撰写人必须携带读取章节上下文时看到的
+        ``expected_auth_revision``；授权号失效（转派/离组/收紧）用旧号
+        保存一律拒绝（STALE_AUTH_REVISION），且响应不含任何新证据。
         """
-        from .errors import StaleRevisionError
+        from . import access
+        from .errors import (AuthzError, StaleRevisionError)
         with self._lock:
             c = self.conn()
             try:
                 with dbmod.transaction(c):
                     return drafts.submit_section(
                         c, draft_id, qid, body, expected_revision=expected_revision,
-                        title=title, submitted_by=submitted_by)
+                        title=title, submitted_by=submitted_by,
+                        expected_auth_revision=expected_auth_revision)
             except StaleRevisionError:
                 with dbmod.transaction(c):
                     drafts.record_stale_conflict(
                         c, draft_id, qid, expected_revision, body, submitted_by)
+                raise
+            except AuthzError as exc:
+                # 业务事务已回滚；授权拒绝留痕在独立事务持久化，绝不丢失，
+                # 也绝不回显受保护内容（denial 只含定位锚/原因码）。
+                denial = getattr(exc, "denial", None)
+                if denial is not None and self.db_path != ":memory:":
+                    access.persist_denial(self.db_path, denial)
                 raise
 
     def section_history(self, section_id: str) -> list[dict]:
@@ -178,16 +192,31 @@ class InquiryOrchestrator:
                        content_type: str = "application/octet-stream",
                        derived_from_ref: str | None = None,
                        uploaded_by: str | None = None,
+                       qid: str | None = None,
+                       expected_auth_revision: int | None = None,
                        attachment_id: str | None = None) -> dict:
-        with self._lock, self.conn() as c, dbmod.transaction(c):
-            return drafts.add_attachment(
-                c, draft_id, filename=filename, content=content,
-                content_type=content_type, derived_from_ref=derived_from_ref,
-                uploaded_by=uploaded_by, attachment_id=attachment_id)
+        from . import access
+        from .errors import AuthzError
+        try:
+            with self._lock, self.conn() as c, dbmod.transaction(c):
+                return drafts.add_attachment(
+                    c, draft_id, filename=filename, content=content,
+                    content_type=content_type, derived_from_ref=derived_from_ref,
+                    uploaded_by=uploaded_by, qid=qid,
+                    expected_auth_revision=expected_auth_revision,
+                    attachment_id=attachment_id)
+        except AuthzError as exc:
+            denial = getattr(exc, "denial", None)
+            if denial is not None and self.db_path != ":memory:":
+                access.persist_denial(self.db_path, denial)
+            raise
 
-    def get_attachment(self, draft_id: str, attachment_id: str) -> dict:
+    def get_attachment(self, draft_id: str, attachment_id: str, *,
+                       actor: str | None = None) -> dict:
+        """下载附件（遵守与章节上下文同一授权边界）。"""
         with self.conn() as c:
-            return drafts.get_attachment_content(c, draft_id, attachment_id)
+            return drafts.get_attachment_content(
+                c, draft_id, attachment_id, actor=actor)
 
     # =======================================================================
     # 4) 冲突查询
@@ -212,6 +241,106 @@ class InquiryOrchestrator:
                 out["contradictions"] = [dict(r) for r in c.execute(
                     "SELECT * FROM contradictions ORDER BY rowid")]
             return out
+
+    # =======================================================================
+    # 4b) 分区写作 / 最小披露权限
+    # =======================================================================
+    def add_member(self, inquiry_id: str, member: str, *, role: str = "WRITER",
+                   acted_by: str | None = None) -> dict:
+        with self._lock, self.conn() as c, dbmod.transaction(c):
+            from . import access
+            return access.add_member(c, inquiry_id, member, role=role,
+                                     acted_by=acted_by)
+
+    def bootstrap_partitioning(self, inquiry_id: str, owner: str, *,
+                               acted_by: str | None = None) -> dict:
+        """把非托管问询（如旧库迁移而来）纳入分区协作，登记首位负责人。
+
+        仅在该问询尚无任何成员时可用一次；之后的成员与授权变更都必须由
+        负责人执行。
+        """
+        with self._lock, self.conn() as c, dbmod.transaction(c):
+            from . import access
+            return access.bootstrap_owner(c, inquiry_id, owner,
+                                          acted_by=acted_by)
+
+    def change_member_role(self, inquiry_id: str, member: str, role: str, *,
+                           acted_by: str | None = None) -> dict:
+        with self._lock, self.conn() as c, dbmod.transaction(c):
+            from . import access
+            return access.change_member_role(c, inquiry_id, member, role,
+                                             acted_by=acted_by)
+
+    def remove_member(self, inquiry_id: str, member: str, *,
+                      acted_by: str | None = None) -> dict:
+        """人员离组：旧授权修订号立即失效；其撰写人授权名单同步收紧。"""
+        with self._lock, self.conn() as c, dbmod.transaction(c):
+            from . import access
+            return access.remove_member(c, inquiry_id, member, acted_by=acted_by)
+
+    def list_members(self, inquiry_id: str, *, active_only: bool = False) -> list[dict]:
+        from . import access
+        with self.conn() as c:
+            return access.list_members(c, inquiry_id, active_only=active_only)
+
+    def put_question_grant(self, inquiry_id: str, qid: str, *,
+                           visible_categories: list[str] | None = None,
+                           visible_fields: list[str] | None = None,
+                           material_ids: list[str] | None = None,
+                           writers: list[str] | None = None,
+                           actor: str | None = None) -> dict:
+        """负责人为问题设置可见资料类别/可见字段/撰写人名单（章节转派即
+        重设 writers）。相同授权请求幂等返回，不增权限、不留重复痕迹。"""
+        with self._lock, self.conn() as c, dbmod.transaction(c):
+            from . import access
+            return access.put_question_grant(
+                c, inquiry_id, qid, visible_categories=visible_categories,
+                visible_fields=visible_fields, material_ids=material_ids,
+                writers=writers, actor=actor)
+
+    def get_question_grant(self, inquiry_id: str, qid: str) -> dict | None:
+        from . import access
+        with self.conn() as c:
+            return access.get_active_grant(c, inquiry_id, qid)
+
+    def list_question_grants(self, inquiry_id: str) -> list[dict]:
+        from . import access
+        with self.conn() as c:
+            return access.active_grants(c, inquiry_id)
+
+    def current_auth_revision(self, inquiry_id: str) -> int:
+        from . import access
+        with self.conn() as c:
+            return access.current_revision(c, inquiry_id)
+
+    def read_section_context(self, draft_id: str, qid: str, *, actor: str) -> dict:
+        """受限章节上下文读取：只返回该撰写人获准的证据片段与可见附件，
+        敏感值以稳定占位符替代（OWNER/非托管获得全量）。"""
+        from . import access
+        with self.conn() as c:
+            return access.read_section_context(c, draft_id, qid, actor=actor)
+
+    def auth_conflicts(self, *, inquiry_id: str | None = None,
+                       draft_id: str | None = None, qid: str | None = None,
+                       reason_code: str | None = None) -> list[dict]:
+        """授权冲突/越权查询（只有定位锚与原因码，不含受保护内容）。"""
+        from . import access
+        with self.conn() as c:
+            return access.list_denials(c, inquiry_id=inquiry_id, draft_id=draft_id,
+                                       qid=qid, reason_code=reason_code)
+
+    def auth_history(self, inquiry_id: str, *, qid: str | None = None) -> dict:
+        """变更历史：授权版本变迁 + 成员事件 + 授权修订号推进序列。"""
+        from . import access
+        with self.conn() as c:
+            grant_events = access.grant_history(c, inquiry_id, qid)
+            member_events = access.list_member_events(c, inquiry_id)
+            denials = access.list_denials(c, inquiry_id=inquiry_id, qid=qid)
+            return {"inquiry_id": inquiry_id,
+                    "current_auth_revision": access.current_revision(c, inquiry_id),
+                    "grant_versions": grant_events,
+                    "member_events": member_events,
+                    "denials": denials}
 
     # =======================================================================
     # 5) 定稿校验（只读报告 / 可恢复作业）

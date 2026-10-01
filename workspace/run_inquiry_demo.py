@@ -59,6 +59,30 @@ def main() -> None:
     for p in draft["pins"]:
         print("  pin:", p["ref"])
 
+    # 3b) 分区写作 / 最小披露：负责人把 alice/bob 加进组并按问题分派
+    step("3b. 负责人按问题设置授权（可见类别/字段/撰写人）")
+    o.add_member(inq["id"], "alice", role="WRITER", acted_by="intake-desk")
+    o.add_member(inq["id"], "bob", role="WRITER", acted_by="intake-desk")
+    # Q1：alice 只能看病历（CASE）且仅 event/outcome 字段；patient_name 等
+    # 以稳定占位符替代。Q2：bob 可看法规与统计。
+    o.put_question_grant(
+        inq["id"], "Q1",
+        visible_categories=["CASE"],
+        visible_fields=["event", "outcome"],
+        material_ids=["CASE-7788"], writers=["alice"],
+        actor="intake-desk")
+    o.put_question_grant(
+        inq["id"], "Q2",
+        visible_categories=["REGULATION", "STATISTIC"],
+        material_ids=["RULE-EXP", "STAT-2026Q3"], writers=["bob"],
+        actor="intake-desk")
+    auth_rev = o.current_auth_revision(inq["id"])
+    print("  当前授权修订号:", auth_rev)
+    ctx = o.read_section_context(draft["id"], "Q1", actor="alice")
+    ev = ctx["evidence"][0]
+    print("  alice 的 Q1 受限证据（只 1 段，未获准资料不出现在响应里）:")
+    print("   ", ev["ref"], "内容字段:", ev["content"])
+
     # 4) 缺失/越权/矛盾会阻断（演示一次越权：另一问询范围只含法规）
     step("4. 引用越权被阻止")
     o.register_material(material_id="OUT-OF-SCOPE", version="1",
@@ -67,39 +91,80 @@ def main() -> None:
         regulator="NMPA", jurisdiction="CN", title="范围受限问询",
         questions=[{"qid": "Q1", "text": "仅可引用法规"}],
         deadline="2026-10-20T00:00:00+00:00",
-        allowed_material_ids=["RULE-EXP"])
+        allowed_material_ids=["RULE-EXP"], registered_by="intake-desk")
     try:
         o.lock_draft(narrow["id"], ["CASE:OUT-OF-SCOPE@1"])
     except Exception as e:
         print("  阻断:", e.code, "-",
               e.details["out_of_scope"][0]["reason"])
 
-    # 5) 多人协作撰写不同章节
-    step("5. 两名撰写人并行提交不同章节")
+    # 5) 多人协作撰写不同章节（各自只引用授权内证据，携带授权修订号）
+    step("5. 两名撰写人并行提交不同章节（最小披露边界内）")
     att = o.add_attachment(draft["id"], filename="病例7788.pdf",
                            content=b"%PDF-1.4 ...case source document...",
-                           derived_from_ref="CASE:CASE-7788@1",
-                           uploaded_by="alice")
+                           derived_from_ref="CASE:CASE-7788@1", qid="Q1",
+                           expected_auth_revision=auth_rev, uploaded_by="alice")
     o.submit_section(
         draft["id"], "Q1",
         f"病例 7788：2026-09-07 皮疹，转归恢复 [CASE:CASE-7788@1]。"
         f"原件见附件 @attachment:{att['id']}",
-        expected_revision=0, submitted_by="alice")
+        expected_revision=0, expected_auth_revision=auth_rev,
+        submitted_by="alice")
     o.submit_section(
         draft["id"], "Q2",
         "严重且非预期，按 15 日加急 [REG:RULE-EXP@2026-1]；"
         "本季度 PRR=2.3（95%CI 1.1-4.8）[STAT:STAT-2026Q3@3]。",
-        expected_revision=0, submitted_by="bob")
+        expected_revision=0, expected_auth_revision=auth_rev,
+        submitted_by="bob")
     print("  Q1 by alice, Q2 by bob 已提交")
 
-    # 6) 乐观修订号：bob 基于过期修订覆盖 Q1 被拒
-    step("6. 竞争更新：过期提交不得覆盖")
+    # 5b) 越权尝试：alice 试图引用未授权的法规 / 下载 bob 的问题证据
+    step("5b. 越权读取/保存被拒（响应不回显受保护内容，只留定位锚）")
+    try:
+        o.read_section_context(draft["id"], "Q2", actor="alice")
+    except Exception as e:
+        print("  读 Q2 被拒:", e.code)
+    try:
+        o.submit_section(
+            draft["id"], "Q1", "越权引用法规 [REG:RULE-EXP@2026-1]",
+            expected_revision=1, expected_auth_revision=auth_rev,
+            submitted_by="alice")
+    except Exception as e:
+        print("  越权引用被拒:", e.code, "被拒锚:",
+              e.details.get("denied_refs"))
+
+    # 6) 乐观修订号：bob 基于过期修订覆盖 Q1 被拒（bob 本就不在 Q1 名单）
+    step("6. 竞争更新：过期提交/未分派不得覆盖")
     try:
         o.submit_section(draft["id"], "Q1", "我要用旧视图覆盖",
-                         expected_revision=0, submitted_by="bob")
+                         expected_revision=0, expected_auth_revision=auth_rev,
+                         submitted_by="bob")
     except Exception as e:
-        print("  拒绝:", e.code, e.details)
-    print("  冲突留痕:", len(o.conflicts(draft["id"])["section_conflicts"]), "条")
+        print("  拒绝:", e.code, "-", {k: v for k, v in e.details.items()
+                                       if k != 'denied_refs'})
+    print("  授权冲突留痕:", len(o.auth_conflicts(inquiry_id=inq["id"])), "条")
+
+    # 6b) 章节转派：Q1 从 alice 转给 carol，旧授权修订号立即失效
+    step("6b. 章节转派 -> 旧页面授权号失效，用旧号保存必须被拒")
+    o.add_member(inq["id"], "carol", role="WRITER", acted_by="intake-desk")
+    o.put_question_grant(
+        inq["id"], "Q1", visible_categories=["CASE"],
+        visible_fields=["event", "outcome"], material_ids=["CASE-7788"],
+        writers=["carol"], actor="intake-desk")
+    new_rev = o.current_auth_revision(inq["id"])
+    try:
+        o.submit_section(draft["id"], "Q1", "alice 用旧授权号保存",
+                         expected_revision=1, expected_auth_revision=auth_rev,
+                         submitted_by="alice")
+    except Exception as e:
+        print("  旧号保存被拒:", e.code, "（当前号", new_rev,
+              "，响应不含新证据）")
+    # 转派回 alice 以便后续定稿（演示负责人调整分派是常态）
+    o.put_question_grant(
+        inq["id"], "Q1", visible_categories=["CASE"],
+        visible_fields=["event", "outcome"], material_ids=["CASE-7788"],
+        writers=["alice"], actor="intake-desk")
+    auth_rev = o.current_auth_revision(inq["id"])
 
     # 7) 组稿期间引用漂移：病例新版本到达，不混入当前底稿，另立候选
     step("7. 引用漂移：病例 v2 到达 -> 带原因的新底稿候选")
@@ -157,14 +222,21 @@ def main() -> None:
                          "STAT:STAT-2026Q3@3"], reason="随访补充转归 v2",
         created_by="alice")
     a1 = corr_draft["attachments"][0]
+    # 更正引用病例 v2：负责人把 Q1 可见资料更新为两个版本（仍不超问询范围）
+    o.put_question_grant(
+        inq["id"], "Q1", visible_categories=["CASE"],
+        visible_fields=["event", "outcome"],
+        material_ids=["CASE-7788"], writers=["alice"], actor="intake-desk")
+    corr_rev = o.current_auth_revision(inq["id"])
     o.submit_section(
         corr_draft["id"], "Q1",
         f"更正：随访仍有色素沉着 [CASE:CASE-7788@2] @attachment:{a1['id']}",
-        expected_revision=1, submitted_by="alice")
+        expected_revision=1, expected_auth_revision=corr_rev,
+        submitted_by="alice")
     o.submit_section(corr_draft["id"], "Q2",
                      "依据不变 [REG:RULE-EXP@2026-1]；"
                      "[STAT:STAT-2026Q3@3]", expected_revision=1,
-                     submitted_by="bob")
+                     expected_auth_revision=corr_rev, submitted_by="bob")
     csealed = o.finalize(corr_draft["id"], sealed_by="lead")
     csub = o.submission_status(csealed["submission_id"])
     cr = o.send(csub["id"])

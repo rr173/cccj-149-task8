@@ -21,6 +21,14 @@ from .util import loads, sha256_raw
 CITATION_RE = re.compile(r"\[(CASE|SENT_REPORT|REG|STAT):([^\]\s@]+)(?:@([^\]\s]+))?\]")
 
 
+def _row_get(row, key: str):
+    """sqlite3.Row 的列可能不存在（旧库迁移前列）时安全取值。"""
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # 问询登记
 # ---------------------------------------------------------------------------
@@ -53,6 +61,10 @@ def register_inquiry(conn, *, regulator: str, jurisdiction: str, questions: list
                                 "questions": questions, "deadline": deadline,
                                 "scope": scope, "title": title},
                        actor=registered_by, inquiry_id=iid, created_at=now)
+    # 登记人自动成为初始负责人（OWNER）；未提供登记人则不进入托管模式，
+    # 保持既有全量组稿行为。
+    from . import access
+    access.seed_owner(conn, iid, registered_by, now=now)
     d = get_inquiry(conn, iid)
     d["deduped"] = False
     return d
@@ -291,9 +303,13 @@ def _clone_sections_and_attachments(conn, src_draft_id: str, dst_draft_id: str,
             (nsid, dst_draft_id, s["qid"], s["title"], s["body"], s["revision"],
              actor, now))
         for rv in history:
+            # 继承修订标记 is_cloned=1 且不带授权快照：更正/候选定稿时，
+            # 继承而来的回答必须由当前授权下的撰写人重新保存过才能定稿
+            # （后续纠正必须按当时有效的授权重新检查）。
             conn.execute(
                 "INSERT INTO section_revisions(id,section_id,revision,body,title,"
-                "submitted_by,submitted_at) VALUES(?,?,?,?,?,?,?)",
+                "submitted_by,submitted_at,auth_revision,writer_key,is_cloned)"
+                " VALUES(?,?,?,?,?,?,?,NULL,NULL,1)",
                 (uuid.uuid4().hex, nsid, rv["revision"], rv["body"], rv["title"],
                  rv["submitted_by"], rv["submitted_at"]))
         # 克隆附件：附件锚 id（filename 之外的稳定 id）保留，便于正文引用延续
@@ -302,12 +318,15 @@ def _clone_sections_and_attachments(conn, src_draft_id: str, dst_draft_id: str,
         derived = a["derived_from_ref"]
         if ref_remap and derived in ref_remap:
             derived = ref_remap[derived]
+        # 附件列在旧库可能由迁移补出；用 keys() 自适应
         conn.execute(
             "INSERT INTO attachments(id,draft_id,filename,content_type,content_blob,"
-            "sha256,derived_from_ref,uploaded_by,created_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?)",
+            "sha256,derived_from_ref,uploaded_by,created_at,auth_revision,"
+            "writer_key,qid,is_cloned)"
+            " VALUES(?,?,?,?,?,?,?,?,?,NULL,NULL,?,1)",
             (a["id"], dst_draft_id, a["filename"], a["content_type"],
-             a["content_blob"], a["sha256"], derived, actor, now))
+             a["content_blob"], a["sha256"], derived, actor, now,
+             _row_get(a, "qid")))
 
 
 def get_draft(conn, draft_id: str, *, include: bool = True) -> dict:
@@ -442,12 +461,19 @@ def record_stale_conflict(conn, draft_id: str, qid: str, expected_revision: int,
 def submit_section(conn, draft_id: str, qid: str, body: str, *,
                    expected_revision: int, title: str = "",
                    submitted_by: str | None = None,
+                   expected_auth_revision: int | None = None,
                    created_at: str | None = None,
                    section_id: str | None = None) -> dict:
     """提交章节内容。
 
     前提：expected_revision 必须等于调用方看到的当前修订号；
     过期提交不覆盖新内容，落冲突记录并抛 STALE_REVISION。
+
+    分区协作（托管问询）下还必须：
+    - 提交人在组且被分派到该问题（OWNER 全权）；
+    - expected_auth_revision 等于当前授权修订号（转派/离组/收紧后旧号
+      立即失效，用旧号保存拒绝且不泄露新证据）；
+    - 正文引用、@attachment 与未授权字段原值均在授权边界内。
     """
     draft = get_draft(conn, draft_id, include=False)
     if draft["status"] != "OPEN":
@@ -461,6 +487,13 @@ def submit_section(conn, draft_id: str, qid: str, body: str, *,
     now = created_at or _now()
     s = conn.execute("SELECT * FROM sections WHERE draft_id=? AND qid=?",
                      (draft_id, qid)).fetchone()
+    # 授权闸门（在乐观修订号检查之前先判身份与授权修订号；任何拒绝都不
+    # 写入章节，也不回显受保护内容）。
+    from . import access
+    authz = access.gate_section_write(
+        conn, draft, qid, body, actor=submitted_by,
+        expected_auth_revision=expected_auth_revision, section_row=s)
+
     if s is None:
         if expected_revision != 0:
             raise StaleRevisionError(
@@ -473,12 +506,15 @@ def submit_section(conn, draft_id: str, qid: str, body: str, *,
             (sid, draft_id, qid, title, body, submitted_by, now))
         conn.execute(
             "INSERT INTO section_revisions(id,section_id,revision,body,title,"
-            "submitted_by,submitted_at) VALUES(?,?,1,?,?,?,?)",
-            (uuid.uuid4().hex, sid, body, title, submitted_by, now))
+            "submitted_by,submitted_at,auth_revision,writer_key,is_cloned)"
+            " VALUES(?,?,1,?,?,?,?,?,?,0)",
+            (uuid.uuid4().hex, sid, body, title, submitted_by, now,
+             authz["auth_revision"], authz["actor_key"]))
         audit.append_event(conn, "SECTION_SUBMITTED",
                            f"章节创建 {qid}（rev=1）",
                            payload={"draft_id": draft_id, "qid": qid,
-                                    "revision": 1, "length": len(body)},
+                                    "revision": 1, "length": len(body),
+                                    "auth_revision": authz["auth_revision"]},
                            actor=submitted_by, inquiry_id=draft["inquiry_id"],
                            draft_id=draft_id, created_at=now)
         return dict(conn.execute("SELECT * FROM sections WHERE id=?",
@@ -498,12 +534,15 @@ def submit_section(conn, draft_id: str, qid: str, body: str, *,
         (title, body, new_rev, submitted_by, now, s["id"], expected_revision))
     conn.execute(
         "INSERT INTO section_revisions(id,section_id,revision,body,title,"
-        "submitted_by,submitted_at) VALUES(?,?,?,?,?,?,?)",
-        (uuid.uuid4().hex, s["id"], new_rev, body, title, submitted_by, now))
+        "submitted_by,submitted_at,auth_revision,writer_key,is_cloned)"
+        " VALUES(?,?,?,?,?,?,?,?,?,0)",
+        (uuid.uuid4().hex, s["id"], new_rev, body, title, submitted_by, now,
+         authz["auth_revision"], authz["actor_key"]))
     audit.append_event(conn, "SECTION_SUBMITTED",
                        f"章节更新 {qid}（rev={new_rev}）",
                        payload={"draft_id": draft_id, "qid": qid,
-                                "revision": new_rev, "length": len(body)},
+                                "revision": new_rev, "length": len(body),
+                                "auth_revision": authz["auth_revision"]},
                        actor=submitted_by, inquiry_id=draft["inquiry_id"],
                        draft_id=draft_id, created_at=now)
     return dict(conn.execute("SELECT * FROM sections WHERE id=?",
@@ -541,6 +580,8 @@ def add_attachment(conn, draft_id: str, *, filename: str, content: bytes,
                    content_type: str = "application/octet-stream",
                    derived_from_ref: str | None = None,
                    uploaded_by: str | None = None,
+                   qid: str | None = None,
+                   expected_auth_revision: int | None = None,
                    created_at: str | None = None,
                    attachment_id: str | None = None) -> dict:
     draft = get_draft(conn, draft_id, include=False)
@@ -557,43 +598,60 @@ def add_attachment(conn, draft_id: str, *, filename: str, content: bytes,
             raise OutOfScopeError(
                 f"附件溯源 {derived_from_ref} 未锁定在本草底稿中",
                 details={"ref": derived_from_ref})
+    # 授权闸门（与章节保存同一边界：在组、授权号新鲜、溯源在问题授权内）。
+    from . import access
+    authz = access.gate_attachment_upload(
+        conn, draft, qid, actor=uploaded_by,
+        expected_auth_revision=expected_auth_revision,
+        derived_from_ref=derived_from_ref)
     now = created_at or _now()
     aid = attachment_id or uuid.uuid4().hex
     digest = sha256_raw(content)
     conn.execute(
         "INSERT INTO attachments(id,draft_id,filename,content_type,content_blob,"
-        "sha256,derived_from_ref,uploaded_by,created_at)"
-        " VALUES(?,?,?,?,?,?,?,?,?)",
+        "sha256,derived_from_ref,uploaded_by,created_at,auth_revision,writer_key,"
+        "qid,is_cloned)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0)",
         (aid, draft_id, filename, content_type, bytes(content), digest,
-         derived_from_ref, uploaded_by, now))
+         derived_from_ref, uploaded_by, now, authz["auth_revision"],
+         authz["actor_key"], qid))
     audit.append_event(conn, "ATTACHMENT_ADDED",
                        f"附件上传 {filename}（{len(content)} 字节）",
                        payload={"draft_id": draft_id, "filename": filename,
                                 "attachment_id": aid, "sha256": digest,
-                                "derived_from_ref": derived_from_ref},
+                                "derived_from_ref": derived_from_ref, "qid": qid,
+                                "auth_revision": authz["auth_revision"]},
                        actor=uploaded_by, inquiry_id=draft["inquiry_id"],
                        draft_id=draft_id, created_at=now)
     return dict(conn.execute("SELECT id,draft_id,filename,content_type,sha256,"
                              "derived_from_ref,uploaded_by,created_at,"
-                             "length(content_blob) AS size FROM attachments WHERE id=?",
+                             "length(content_blob) AS size,auth_revision,writer_key,"
+                             "qid,is_cloned FROM attachments WHERE id=?",
                              (aid,)).fetchone())
 
 
 def list_attachments(conn, draft_id: str, *, with_content: bool = False) -> list[dict]:
     cols = ("id,draft_id,filename,content_type,sha256,derived_from_ref,uploaded_by,"
-            "created_at,length(content_blob) AS size")
+            "created_at,length(content_blob) AS size,auth_revision,writer_key,qid,"
+            "is_cloned")
     rows = conn.execute(
         f"SELECT {cols}{', content_blob' if with_content else ''} FROM attachments "
         "WHERE draft_id=? ORDER BY filename", (draft_id,)).fetchall()
     return [dict(r) for r in rows]
 
 
-def get_attachment_content(conn, draft_id: str, attachment_id: str) -> dict:
+def get_attachment_content(conn, draft_id: str, attachment_id: str, *,
+                           actor: str | None = None) -> dict:
     r = conn.execute("SELECT * FROM attachments WHERE draft_id=? AND id=?",
                      (draft_id, attachment_id)).fetchone()
     if not r:
         raise NotFoundError(f"附件不存在: {attachment_id}")
-    return dict(r)
+    att = dict(r)
+    # 下载遵守同一授权边界（OWNER/非托管放行；WRITER 需当前有资格）。
+    from . import access
+    draft = get_draft(conn, draft_id, include=False)
+    access.gate_attachment_download(conn, draft, att, actor=actor)
+    return att
 
 
 def extract_citations(text: str) -> list[dict]:

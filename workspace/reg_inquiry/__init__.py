@@ -13,6 +13,8 @@ from .errors import (
     InquiryError, ValidationFailed, MissingMaterialsError, OutOfScopeError,
     StaleRevisionError, DraftSealedError, VersionConflictError,
     JobFailed, TransportTempError, TransportRejectError,
+    NotAuthorizedError, NotGroupMemberError, NotAssignedError,
+    StaleAuthRevisionError, EvidenceAccessDeniedError,
 )
 
 __all__ = [
@@ -27,4 +29,9 @@ __all__ = [
     "JobFailed",
     "TransportTempError",
     "TransportRejectError",
+    "NotAuthorizedError",
+    "NotGroupMemberError",
+    "NotAssignedError",
+    "StaleAuthRevisionError",
+    "EvidenceAccessDeniedError",
 ]

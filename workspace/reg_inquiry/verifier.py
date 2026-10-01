@@ -70,6 +70,38 @@ def verify_submission(conn, submission_id: str) -> dict:
         if ans["section_revision"] != sec["revision"]:
             failures.append({"code": "REVISION_MISMATCH", "qid": qid,
                              "message": f"问题 {qid} 修订号已偏离封存值"})
+        # 授权快照一致：manifest 冻结的“最后保存”授权修订号/撰写人必须与
+        # 只增 section_revisions 中链头修订行一致（防封存后被人调换授权归属）。
+        last_rev = conn.execute(
+            "SELECT auth_revision,writer_key,is_cloned FROM section_revisions "
+            "WHERE section_id=? ORDER BY revision DESC LIMIT 1",
+            (sec["id"],)).fetchone()
+        if last_rev is not None:
+            if ans.get("auth_revision") != last_rev["auth_revision"]:
+                failures.append({"code": "AUTHZ_REVISION_MISMATCH", "qid": qid,
+                                 "message": f"问题 {qid} 授权修订号快照与"
+                                            "章节链头修订不一致"})
+            if ans.get("writer_key") != last_rev["writer_key"]:
+                failures.append({"code": "AUTHZ_WRITER_MISMATCH", "qid": qid,
+                                 "message": f"问题 {qid} 撰写人快照与"
+                                            "章节链头修订不一致"})
+            if bool(ans.get("is_cloned_revision")) != bool(last_rev["is_cloned"]):
+                failures.append({"code": "AUTHZ_CLONE_FLAG_MISMATCH", "qid": qid,
+                                 "message": f"问题 {qid} 继承修订标记与"
+                                            "章节链头修订不一致"})
+            # 托管问询封存的最终修订必须自带授权快照且非继承修订；
+            # 该问题的保存资格已由 validation.check_authz_at_finalize 逐问
+            # 按当时授权重放，这里独立兜底，不读取/回显任何资料原值。
+            managed = conn.execute(
+                "SELECT 1 FROM group_members WHERE inquiry_id=? LIMIT 1",
+                (sub["inquiry_id"],)).fetchone()
+            if managed and (last_rev["auth_revision"] is None
+                            or last_rev["writer_key"] is None
+                            or last_rev["is_cloned"]):
+                failures.append({"code": "AUTHZ_SNAPSHOT_MISSING", "qid": qid,
+                                 "message": f"问题 {qid} 封存修订缺少合法的"
+                                            "保存时授权快照（或为未重新授权的"
+                                            "继承修订）"})
     if set(sections) != manifest_qids:
         extra = set(sections) - manifest_qids
         if extra:
@@ -106,6 +138,20 @@ def verify_submission(conn, submission_id: str) -> dict:
                 failures.append({"code": "ATTACHMENT_HASH_MISMATCH",
                                  "attachment_id": a["attachment_id"],
                                  "message": f"附件 {a['filename']} 哈希不符"})
+            # 授权快照一致性（定位字段，不含内容）
+            def _col(r, name):
+                try:
+                    return r[name]
+                except (IndexError, KeyError):
+                    return None
+            if a.get("auth_revision") != _col(row, "auth_revision") \
+                    or a.get("writer_key") != _col(row, "writer_key") \
+                    or a.get("qid") != _col(row, "qid"):
+                failures.append({"code": "ATTACHMENT_AUTHZ_MISMATCH",
+                                 "attachment_id": a["attachment_id"], "qid":
+                                 a.get("qid"),
+                                 "message": f"附件 {a['filename']} 的授权快照"
+                                            "与附件行不一致"})
 
     # 5) 外发编号唯一 + 履历状态机
     dup = conn.execute(

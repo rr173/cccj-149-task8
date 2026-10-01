@@ -39,6 +39,12 @@ def build_manifest(conn, draft: dict, *, submission_id: str, kind: str,
                                 sec["body"] + "\n" + sec["title"])
                             if c["version"]})
         attach_refs = validation._extract_attach_refs(sec["body"])
+        # 封存时冻结“最后一次保存”的授权快照（修订号/撰写人/是否继承修订），
+        # 供独立核对重放：每问回答者在每次引用与附件上传时是否有读取资格。
+        last_rev = conn.execute(
+            "SELECT auth_revision,writer_key,is_cloned FROM section_revisions "
+            "WHERE section_id=? ORDER BY revision DESC LIMIT 1",
+            (sec["id"],)).fetchone()
         answers.append({
             "qid": sec["qid"],
             "answer_uid": _answer_uid(draft["id"], sec["qid"], sec["id"],
@@ -48,11 +54,17 @@ def build_manifest(conn, draft: dict, *, submission_id: str, kind: str,
             "title": sec["title"],
             "body_sha256": sha256_hex(sec["body"]),
             "citations": cite_refs,
+            "auth_revision": last_rev["auth_revision"] if last_rev else None,
+            "writer_key": last_rev["writer_key"] if last_rev else None,
+            "is_cloned_revision": bool(last_rev and last_rev["is_cloned"]),
             "attachments": [{
                 "attachment_id": aid,
                 "filename": attach_by_id[aid]["filename"],
                 "sha256": attach_by_id[aid]["sha256"],
                 "derived_from_ref": attach_by_id[aid]["derived_from_ref"],
+                "qid": attach_by_id[aid].get("qid"),
+                "auth_revision": attach_by_id[aid].get("auth_revision"),
+                "writer_key": attach_by_id[aid].get("writer_key"),
             } for aid in sorted(set(attach_refs)) if aid in attach_by_id],
         })
     return {

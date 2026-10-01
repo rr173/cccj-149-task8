@@ -135,7 +135,10 @@ CREATE TABLE IF NOT EXISTS sections (
 );
 CREATE INDEX IF NOT EXISTS ix_sections_draft ON sections(draft_id);
 
--- 章节修订历史（只增；过期提交被拒绝的冲突也留痕）
+-- 章节修订历史（只增；过期提交被拒绝的冲突也留痕）。
+-- auth_revision：该次保存所依据的“授权修订号”（NULL=非托管问询/克隆继承）；
+-- writer_key：保存者规范化身份键；is_cloned：克隆自来源底稿的继承修订
+-- （更正件定稿时继承修订必须重新授权，见 validation）。
 CREATE TABLE IF NOT EXISTS section_revisions (
     id              TEXT PRIMARY KEY,
     section_id      TEXT NOT NULL REFERENCES sections(id),
@@ -144,7 +147,136 @@ CREATE TABLE IF NOT EXISTS section_revisions (
     title           TEXT NOT NULL DEFAULT '',
     submitted_by    TEXT,
     submitted_at    TEXT NOT NULL,
+    auth_revision   INTEGER,
+    writer_key      TEXT,
+    is_cloned       INTEGER NOT NULL DEFAULT 0,
     UNIQUE(section_id, revision)
+);
+
+-- 竞争更新冲突：以调用方看到的修订为前提，过期提交不覆盖，记录于此
+CREATE TABLE IF NOT EXISTS section_conflicts (
+    id              TEXT PRIMARY KEY,
+    section_id      TEXT NOT NULL REFERENCES sections(id),
+    expected_revision INTEGER NOT NULL,
+    actual_revision INTEGER NOT NULL,
+    attempted_by    TEXT,
+    body_preview    TEXT NOT NULL DEFAULT '',
+    reason          TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_conflict_section ON section_conflicts(section_id);
+
+-- 附件（按底稿冻结；derived_from_material 必须指向已锁定资料）。
+-- auth_revision/writer_key：上传时的授权修订号与上传者身份键；
+-- qid：上传归属问题（附件授权按问题授权判定）。
+CREATE TABLE IF NOT EXISTS attachments (
+    id              TEXT NOT NULL,           -- 稳定附件锚（跨候选/更正克隆保留，
+                                             -- 正文 @attachment:<id> 引用不断）
+    draft_id        TEXT NOT NULL REFERENCES drafts(id),
+    filename        TEXT NOT NULL,
+    content_type    TEXT NOT NULL DEFAULT 'application/octet-stream',
+    content_blob    BLOB NOT NULL,
+    sha256          TEXT NOT NULL,
+    derived_from_ref TEXT,                   -- 如 CASE:MAT-1@3
+    uploaded_by     TEXT,
+    created_at      TEXT NOT NULL,
+    auth_revision   INTEGER,
+    writer_key      TEXT,
+    qid             TEXT,
+    is_cloned       INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (draft_id, id)
+);
+CREATE INDEX IF NOT EXISTS ix_attach_draft ON attachments(draft_id);
+
+--------------------------------------------------------------------------------
+-- 分区写作与最小披露权限
+--------------------------------------------------------------------------------
+-- 组成员事件（只增）：加入/角色变更/离组全部追加，区间由时间序重建，
+-- 供“保存当时是否在组”的历史判定与变更历史查询。
+CREATE TABLE IF NOT EXISTS group_member_events (
+    id              TEXT PRIMARY KEY,
+    inquiry_id      TEXT NOT NULL REFERENCES inquiries(id),
+    member_key      TEXT NOT NULL,           -- 规范化身份键
+    member_raw      TEXT NOT NULL,           -- 原始提交值原样留痕
+    action          TEXT NOT NULL
+                    CHECK (action IN ('JOINED','ROLE_CHANGED','LEFT')),
+    role            TEXT NOT NULL CHECK (role IN ('OWNER','WRITER')),
+    auth_revision   INTEGER,                 -- 事件生效时所在授权修订号
+    acted_by        TEXT,
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_member_events_inq
+    ON group_member_events(inquiry_id, member_key);
+
+-- 组成员当前状态（由事件物化；允许 UPSERT/离组置 0，其余列由触发器锁定）
+CREATE TABLE IF NOT EXISTS group_members (
+    inquiry_id      TEXT NOT NULL REFERENCES inquiries(id),
+    member_key      TEXT NOT NULL,
+    member_raw      TEXT NOT NULL,
+    role            TEXT NOT NULL CHECK (role IN ('OWNER','WRITER')),
+    active          INTEGER NOT NULL DEFAULT 1,
+    joined_at       TEXT NOT NULL,
+    left_at         TEXT,
+    PRIMARY KEY (inquiry_id, member_key)
+);
+CREATE INDEX IF NOT EXISTS ix_members_active
+    ON group_members(inquiry_id, active);
+
+-- 每问授权（只增版本化）：负责人为一个问题设置可见资料类别、可见字段与
+-- 撰写人名单。同一 (问询,问题) 只有一行 ACTIVE；任何重设都把旧行置
+-- SUPERSEDED 并推进问询级授权修订号（旧页面携带的授权号立即失效）。
+CREATE TABLE IF NOT EXISTS question_grants (
+    id                  TEXT PRIMARY KEY,
+    inquiry_id          TEXT NOT NULL REFERENCES inquiries(id),
+    qid                 TEXT NOT NULL,
+    grant_version       INTEGER NOT NULL,    -- 该问题内从 1 递增
+    visible_categories_json TEXT NOT NULL,   -- ["CASE",...]
+    visible_fields_json TEXT NOT NULL,       -- []=全部可见；否则字段白名单
+    material_ids_json   TEXT NOT NULL,       -- []=全部（不超问询冻结范围）
+    writers_json        TEXT NOT NULL,       -- 规范化撰写人身份键列表
+    status              TEXT NOT NULL DEFAULT 'ACTIVE'
+                        CHECK (status IN ('ACTIVE','SUPERSEDED')),
+    auth_revision       INTEGER NOT NULL,
+    superseded_revision  INTEGER,
+    created_by          TEXT,
+    created_at          TEXT NOT NULL,
+    UNIQUE(inquiry_id, qid, grant_version)
+);
+CREATE INDEX IF NOT EXISTS ix_grants_active
+    ON question_grants(inquiry_id, qid, status);
+
+-- 问询级授权修订号单行游标：章节转派 / 人员离组 / 权限收紧都推进它，
+-- 旧页面用旧号保存一律拒绝（STALE_AUTH_REVISION）。
+CREATE TABLE IF NOT EXISTS auth_revision_seq (
+    inquiry_id  TEXT PRIMARY KEY REFERENCES inquiries(id),
+    revision    INTEGER NOT NULL DEFAULT 0
+);
+
+-- 授权冲突/越权留痕（只增；绝不保存被保护的正文或资料原值，
+-- 只记录问题/章节/被拒资料/引用锚/附件 id 等非敏感定位信息）。
+CREATE TABLE IF NOT EXISTS auth_denials (
+    id              TEXT PRIMARY KEY,
+    inquiry_id      TEXT NOT NULL REFERENCES inquiries(id),
+    draft_id        TEXT,
+    qid             TEXT,
+    section_id      TEXT,
+    actor_key       TEXT,
+    reason_code     TEXT NOT NULL,
+    -- 被拒资料引用锚（如 CASE:MAT-X@1），不含资料内容
+    denied_refs_json TEXT NOT NULL DEFAULT '[]',
+    denied_attachment_ids_json TEXT NOT NULL DEFAULT '[]',
+    had_auth_revision INTEGER,
+    current_auth_revision INTEGER,
+    detail          TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_denials_inquiry ON auth_denials(inquiry_id, created_at);
+CREATE INDEX IF NOT EXISTS ix_denials_draft ON auth_denials(draft_id);
+
+-- 库级元数据（稳定占位符盐等）
+CREATE TABLE IF NOT EXISTS app_meta (
+    key     TEXT PRIMARY KEY,
+    value   TEXT NOT NULL
 );
 
 -- 竞争更新冲突：以调用方看到的修订为前提，过期提交不覆盖，记录于此
@@ -363,6 +495,55 @@ BEGIN SELECT RAISE(FAIL, 'section_revisions is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_section_rev_no_delete BEFORE DELETE ON section_revisions
 BEGIN SELECT RAISE(FAIL, 'section_revisions is append-only'); END;
 
+CREATE TRIGGER IF NOT EXISTS trg_member_events_no_update BEFORE UPDATE ON group_member_events
+BEGIN SELECT RAISE(FAIL, 'group_member_events is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_member_events_no_delete BEFORE DELETE ON group_member_events
+BEGIN SELECT RAISE(FAIL, 'group_member_events is append-only'); END;
+
+-- 组成员当前状态：仅允许角色推进（WRITER->OWNER）、离组置 active=0；
+-- 身份键/问询/加入时间冻结，禁止删除。
+CREATE TRIGGER IF NOT EXISTS trg_members_guard BEFORE UPDATE ON group_members
+WHEN NOT (
+    NEW.inquiry_id IS OLD.inquiry_id AND NEW.member_key IS OLD.member_key
+    AND NEW.member_raw IS OLD.member_raw AND NEW.joined_at IS OLD.joined_at
+    AND (
+        (OLD.active=1 AND NEW.active=0 AND NEW.role IS OLD.role)
+        OR (NEW.active=1 AND OLD.active=1 AND NEW.role='OWNER')
+    )
+)
+BEGIN SELECT RAISE(FAIL, 'group_members: only role promotion or deactivation allowed'); END;
+CREATE TRIGGER IF NOT EXISTS trg_members_no_delete BEFORE DELETE ON group_members
+BEGIN SELECT RAISE(FAIL, 'group_members is append-only (leave -> active=0)'); END;
+
+-- 每问授权行只允许 ACTIVE -> SUPERSEDED 且写 superseded_revision；
+-- 其余冻结。新版本是新插入的行。
+CREATE TRIGGER IF NOT EXISTS trg_grants_guard BEFORE UPDATE ON question_grants
+WHEN NOT (
+    NEW.id IS OLD.id AND NEW.inquiry_id IS OLD.inquiry_id
+    AND NEW.qid IS OLD.qid AND NEW.grant_version IS OLD.grant_version
+    AND NEW.visible_categories_json IS OLD.visible_categories_json
+    AND NEW.visible_fields_json IS OLD.visible_fields_json
+    AND NEW.material_ids_json IS OLD.material_ids_json
+    AND NEW.writers_json IS OLD.writers_json
+    AND NEW.auth_revision IS OLD.auth_revision
+    AND NEW.created_by IS OLD.created_by AND NEW.created_at IS OLD.created_at
+    AND OLD.status='ACTIVE' AND NEW.status='SUPERSEDED'
+    AND NEW.superseded_revision IS NOT NULL
+)
+BEGIN SELECT RAISE(FAIL, 'question_grants: only ACTIVE -> SUPERSEDED allowed'); END;
+CREATE TRIGGER IF NOT EXISTS trg_grants_no_delete BEFORE DELETE ON question_grants
+BEGIN SELECT RAISE(FAIL, 'question_grants is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_denials_no_update BEFORE UPDATE ON auth_denials
+BEGIN SELECT RAISE(FAIL, 'auth_denials is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_denials_no_delete BEFORE DELETE ON auth_denials
+BEGIN SELECT RAISE(FAIL, 'auth_denials is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_meta_no_update BEFORE UPDATE ON app_meta
+BEGIN SELECT RAISE(FAIL, 'app_meta is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_meta_no_delete BEFORE DELETE ON app_meta
+BEGIN SELECT RAISE(FAIL, 'app_meta is append-only'); END;
+
 CREATE TRIGGER IF NOT EXISTS trg_conflicts_no_update BEFORE UPDATE ON section_conflicts
 BEGIN SELECT RAISE(FAIL, 'section_conflicts is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_conflicts_no_delete BEFORE DELETE ON section_conflicts
@@ -449,8 +630,40 @@ def initialize(db_path: str | Path) -> None:
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
     finally:
         conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """旧库补列（分区写作/最小披露权限引入的授权快照列）。
+
+    旧行的 auth_revision/writer_key 为 NULL、is_cloned=0：旧库中不存在
+    任何负责人/授权行（走非托管模式），故历史章节/附件按既有行为继续
+    可读可定稿；一旦某问询登记了负责人与授权，新保存必须带授权修订号。
+    """
+    def columns(table: str) -> set[str]:
+        return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+    rev_cols = columns("section_revisions")
+    for ddl in (
+        "ALTER TABLE section_revisions ADD COLUMN auth_revision INTEGER",
+        "ALTER TABLE section_revisions ADD COLUMN writer_key TEXT",
+        "ALTER TABLE section_revisions ADD COLUMN is_cloned INTEGER NOT NULL DEFAULT 0",
+    ):
+        col = ddl.split("ADD COLUMN")[1].strip().split()[0]
+        if col not in rev_cols:
+            conn.execute(ddl)
+    att_cols = columns("attachments")
+    for ddl in (
+        "ALTER TABLE attachments ADD COLUMN auth_revision INTEGER",
+        "ALTER TABLE attachments ADD COLUMN writer_key TEXT",
+        "ALTER TABLE attachments ADD COLUMN qid TEXT",
+        "ALTER TABLE attachments ADD COLUMN is_cloned INTEGER NOT NULL DEFAULT 0",
+    ):
+        col = ddl.split("ADD COLUMN")[1].strip().split()[0]
+        if col not in att_cols:
+            conn.execute(ddl)
 
 
 @contextmanager

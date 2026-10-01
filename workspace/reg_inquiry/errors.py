@@ -90,3 +90,49 @@ class TransportRejectError(InquiryError):
     """监管网关明确拒收（终态，不重试）。"""
 
     code = "TRANSPORT_REJECT"
+
+
+# ---------------------------------------------------------------------------
+# 分区写作 / 最小披露权限
+# ---------------------------------------------------------------------------
+class AuthzError(InquiryError):
+    """授权相关拒绝基类（响应中绝不包含被保护资料/正文内容）。"""
+
+    code = "AUTHZ_ERROR"
+
+
+class NotAuthorizedError(AuthzError):
+    """非负责人/越权管理操作（如非 OWNER 试图设置授权）。"""
+
+    code = "NOT_AUTHORIZED"
+
+
+class NotGroupMemberError(AuthzError):
+    """人员已离组或从未入组，却试图读取章节上下文/保存/上传。"""
+
+    code = "NOT_GROUP_MEMBER"
+
+
+class NotAssignedError(AuthzError):
+    """撰写人在该问题上没有任何有效授权（未被分派）。详情只含 qid。"""
+
+    code = "NOT_ASSIGNED"
+
+
+class StaleAuthRevisionError(AuthzError):
+    """页面携带的授权修订号已失效（转派/离组/权限收紧后用旧号保存）。
+
+    ``details`` 只回传 qid 与当前修订号供刷新页面，不泄露新证据内容。
+    """
+
+    code = "STALE_AUTH_REVISION"
+
+
+class EvidenceAccessDeniedError(AuthzError):
+    """引用/附件/下载越出该问题授权边界，或正文携带了未授权字段原值。
+
+    ``details['denied_refs']`` / ``denied_attachments`` 只含引用锚与附件 id
+    （定位信息），绝不回显资料原值或正文。
+    """
+
+    code = "EVIDENCE_ACCESS_DENIED"
