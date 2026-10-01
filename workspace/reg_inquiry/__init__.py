@@ -6,13 +6,17 @@
 
 能力一览（见 ``InquiryOrchestrator``）：
 问询登记 / 底稿锁定 / 章节协作 / 冲突查询 / 定稿校验 / 发送与重试 /
-回执登记 / 更正关系 / 独立核对 / 操作留痕。
+回执登记 / 更正关系 / 独立核对 / 操作留痕 /
+分区写作与最小披露授权（逐问可见类别/字段/撰写人、授权修订号失效、
+受限上下文稳定占位、附件同边界、封存不变、更正按当时授权重检）。
 """
 from .orchestrator import InquiryOrchestrator
 from .errors import (
     InquiryError, ValidationFailed, MissingMaterialsError, OutOfScopeError,
     StaleRevisionError, DraftSealedError, VersionConflictError,
     JobFailed, TransportTempError, TransportRejectError,
+    AuthorizationError, InvalidActorError, NotEnrolledError, ForbiddenError,
+    StaleAuthzRevisionError, AuthzConflictError,
 )
 
 __all__ = [
@@ -27,4 +31,11 @@ __all__ = [
     "JobFailed",
     "TransportTempError",
     "TransportRejectError",
+    # 分区写作 / 最小披露权限
+    "AuthorizationError",
+    "InvalidActorError",
+    "NotEnrolledError",
+    "ForbiddenError",
+    "StaleAuthzRevisionError",
+    "AuthzConflictError",
 ]

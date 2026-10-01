@@ -129,6 +129,9 @@ CREATE TABLE IF NOT EXISTS sections (
     title           TEXT NOT NULL DEFAULT '',
     body            TEXT NOT NULL DEFAULT '',
     revision        INTEGER NOT NULL DEFAULT 0,   -- 乐观修订号（每次提交 +1）
+    -- 本次内容写入时的授权修订号；克隆继承的内容为 NULL，必须由合格撰写人
+    -- 在当前授权下重新保存后才允许进入定稿（后续纠正按当时授权重新检查）。
+    authz_revision  INTEGER,
     updated_by      TEXT,
     updated_at      TEXT NOT NULL,
     UNIQUE(draft_id, qid)
@@ -142,6 +145,7 @@ CREATE TABLE IF NOT EXISTS section_revisions (
     revision        INTEGER NOT NULL,
     body            TEXT NOT NULL,
     title           TEXT NOT NULL DEFAULT '',
+    authz_revision  INTEGER,                       -- 写入时授权修订号（克隆行 NULL）
     submitted_by    TEXT,
     submitted_at    TEXT NOT NULL,
     UNIQUE(section_id, revision)
@@ -165,11 +169,14 @@ CREATE TABLE IF NOT EXISTS attachments (
     id              TEXT NOT NULL,           -- 稳定附件锚（跨候选/更正克隆保留，
                                              -- 正文 @attachment:<id> 引用不断）
     draft_id        TEXT NOT NULL REFERENCES drafts(id),
+    qid             TEXT,                    -- 归属问题（启用授权时必填；
+                                             -- 下载/定稿按该问题授权边界校验）
     filename        TEXT NOT NULL,
     content_type    TEXT NOT NULL DEFAULT 'application/octet-stream',
     content_blob    BLOB NOT NULL,
     sha256          TEXT NOT NULL,
     derived_from_ref TEXT,                   -- 如 CASE:MAT-1@3
+    upload_authz_revision INTEGER,           -- 上传/再认定时授权修订号（克隆 NULL）
     uploaded_by     TEXT,
     created_at      TEXT NOT NULL,
     PRIMARY KEY (draft_id, id)
@@ -295,6 +302,96 @@ CREATE TABLE IF NOT EXISTS outgoing_number_seq (
     scope   TEXT PRIMARY KEY,   -- <jurisdiction>:<year>
     last_no INTEGER NOT NULL DEFAULT 0
 );
+
+--------------------------------------------------------------------------------
+-- 分区写作 / 最小披露权限
+--------------------------------------------------------------------------------
+-- 每问询一行的授权修订号指针。仅在成员名单或逐问授权 *实质变化* 时
+-- （负责人转派/人员离组/授权收紧或放宽）在业务事务内 +1；授权状态下
+-- 页面保存必须携带保存时看到的本号，旧号一律 STALE_AUTHZ_REVISION。
+-- 行只更新 revision 一列（触发器白名单），历史在 authz_changes 只增台账。
+CREATE TABLE IF NOT EXISTS inquiry_authz (
+    inquiry_id      TEXT PRIMARY KEY REFERENCES inquiries(id),
+    authz_revision  INTEGER NOT NULL DEFAULT 0,   -- 0=未启用（legacy 宽松路径）
+    lead_key        TEXT,                         -- 当前负责人规范化键
+    updated_at      TEXT NOT NULL
+);
+
+-- 成员名册（只增台账）：一人多行（移除后再加入即新行）。
+-- 某人是否“在册”由最新一行 active 决定，任何修订号时点都可 as-of 重放。
+CREATE TABLE IF NOT EXISTS inquiry_members (
+    id              TEXT PRIMARY KEY,
+    inquiry_id      TEXT NOT NULL REFERENCES inquiries(id),
+    identity_key    TEXT NOT NULL,              -- NFKC+casefold 稳定键
+    raw_identity    TEXT NOT NULL,              -- 原始提交值原样留痕
+    role            TEXT NOT NULL CHECK (role IN ('LEAD','WRITER')),
+    active          INTEGER NOT NULL,
+    since_revision  INTEGER NOT NULL,           -- 本行生效时的授权修订号
+    reason          TEXT NOT NULL DEFAULT '',
+    added_by        TEXT,
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_members_inquiry ON inquiry_members(inquiry_id, identity_key);
+
+-- 逐问授权（只增版本台账）。负责人可为每个问题设置可见资料类别、
+-- 可见字段与撰写人名单；授权投影（受限上下文/保存校验/定稿复核）读取
+-- 某修订号时点上的最新版本行。
+CREATE TABLE IF NOT EXISTS question_grants (
+    id              TEXT PRIMARY KEY,
+    inquiry_id      TEXT NOT NULL REFERENCES inquiries(id),
+    qid             TEXT NOT NULL,
+    revision        INTEGER NOT NULL,           -- 本行生效时的授权修订号
+    categories_json TEXT NOT NULL,              -- 可见资料类别（子集）
+    fields_json     TEXT NOT NULL,              -- 可见字段（[]=任何字段值均不可见）
+    writer_keys_json TEXT NOT NULL,             -- 在列撰写人规范化键
+    writers_raw_json TEXT NOT NULL,             -- 撰写人原始写法留痕
+    updated_by      TEXT,
+    created_at      TEXT NOT NULL,
+    UNIQUE(inquiry_id, qid, revision)
+);
+CREATE INDEX IF NOT EXISTS ix_grants_q ON question_grants(inquiry_id, qid, revision);
+
+-- 越权留痕（只增）：保存/上传/下载/定稿复核发现的每一项越权逐条记录。
+-- 只记 *标识*（问题/章节/引用锚/类别/附件 id/动作），绝不回显受保护内容。
+CREATE TABLE IF NOT EXISTS authz_denials (
+    id              TEXT PRIMARY KEY,
+    inquiry_id      TEXT NOT NULL REFERENCES inquiries(id),
+    draft_id        TEXT,
+    qid             TEXT,
+    section_id      TEXT,
+    actor_key       TEXT,
+    action          TEXT NOT NULL
+                    CHECK (action IN ('SAVE_SECTION','UPLOAD_ATTACHMENT',
+                                      'DOWNLOAD_ATTACHMENT','READ_CONTEXT',
+                                      'FINALIZE_CHECK')),
+    code            TEXT NOT NULL,              -- FORBIDDEN / SECTION_UNQUALIFIED / ...
+    denied_ref      TEXT,                       -- 引用锚（不存内容）
+    category        TEXT,
+    attachment_id   TEXT,
+    authz_revision  INTEGER,
+    detail          TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_denials_inquiry ON authz_denials(inquiry_id, id);
+CREATE INDEX IF NOT EXISTS ix_denials_draft ON authz_denials(draft_id);
+
+-- 附件再认定（只增）：克隆（候选/更正）带来的附件溯源是旧修订号，
+-- 负责人或该问题的在列撰写人须在 *当前* 授权下重新认定后，附件才可被
+-- 新底稿引用定稿。同 (draft,attachment) 的重复再认定不重复留痕（由
+-- 部分唯一索引兜底；每次重新认定产生新行以保留历史）。
+CREATE TABLE IF NOT EXISTS attachment_requalifications (
+    id              TEXT PRIMARY KEY,
+    draft_id        TEXT NOT NULL REFERENCES drafts(id),
+    attachment_id   TEXT NOT NULL,
+    qid             TEXT NOT NULL,
+    requalified_by_key TEXT NOT NULL,
+    requalified_by_raw TEXT,
+    authz_revision  INTEGER NOT NULL,
+    created_at      TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_requal_once
+    ON attachment_requalifications(draft_id, attachment_id, authz_revision);
+CREATE INDEX IF NOT EXISTS ix_requal_draft ON attachment_requalifications(draft_id);
 
 --------------------------------------------------------------------------------
 -- 操作留痕（全局只增哈希链）
@@ -442,15 +539,69 @@ CREATE TRIGGER IF NOT EXISTS trg_audit_no_update BEFORE UPDATE ON audit_events
 BEGIN SELECT RAISE(FAIL, 'audit_events is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_audit_no_delete BEFORE DELETE ON audit_events
 BEGIN SELECT RAISE(FAIL, 'audit_events is append-only'); END;
+
+-- 授权修订指针：只允许 revision/lead_key/updated_at 推进（实质变化时 +1），
+-- 不允许把已启用的问询退回未启用状态（revision 只能单调递增）。
+CREATE TRIGGER IF NOT EXISTS trg_inquiry_authz_guard BEFORE UPDATE ON inquiry_authz
+WHEN NOT (
+    NEW.inquiry_id IS OLD.inquiry_id
+    AND NEW.authz_revision >= OLD.authz_revision
+    AND (NEW.authz_revision > OLD.authz_revision
+         OR (NEW.lead_key IS OLD.lead_key AND NEW.updated_at IS OLD.updated_at))
+)
+BEGIN SELECT RAISE(FAIL, 'inquiry_authz: revision may only advance'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_members_no_update BEFORE UPDATE ON inquiry_members
+BEGIN SELECT RAISE(FAIL, 'inquiry_members is append-only (add a new row)'); END;
+CREATE TRIGGER IF NOT EXISTS trg_members_no_delete BEFORE DELETE ON inquiry_members
+BEGIN SELECT RAISE(FAIL, 'inquiry_members is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_grants_no_update BEFORE UPDATE ON question_grants
+BEGIN SELECT RAISE(FAIL, 'question_grants is append-only (register a new version)'); END;
+CREATE TRIGGER IF NOT EXISTS trg_grants_no_delete BEFORE DELETE ON question_grants
+BEGIN SELECT RAISE(FAIL, 'question_grants is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_denials_no_update BEFORE UPDATE ON authz_denials
+BEGIN SELECT RAISE(FAIL, 'authz_denials is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_denials_no_delete BEFORE DELETE ON authz_denials
+BEGIN SELECT RAISE(FAIL, 'authz_denials is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_requal_no_update BEFORE UPDATE ON attachment_requalifications
+BEGIN SELECT RAISE(FAIL, 'attachment_requalifications is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_requal_no_delete BEFORE DELETE ON attachment_requalifications
+BEGIN SELECT RAISE(FAIL, 'attachment_requalifications is append-only'); END;
 """
+
+
+# 旧库迁移：既有表在新列出现前已建（CREATE TABLE IF NOT EXISTS 不会补列），
+# 以“列存在性探测 + ALTER TABLE ADD COLUMN”补齐；全新库由 SCHEMA 直接建出。
+_MIGRATIONS = (
+    ("sections", "authz_revision",
+     "ALTER TABLE sections ADD COLUMN authz_revision INTEGER"),
+    ("section_revisions", "authz_revision",
+     "ALTER TABLE section_revisions ADD COLUMN authz_revision INTEGER"),
+    ("attachments", "qid",
+     "ALTER TABLE attachments ADD COLUMN qid TEXT"),
+    ("attachments", "upload_authz_revision",
+     "ALTER TABLE attachments ADD COLUMN upload_authz_revision INTEGER"),
+)
 
 
 def initialize(db_path: str | Path) -> None:
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
     finally:
         conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """旧库补列（已存在列则跳过）；幂等，可重复执行。"""
+    for table, column, ddl in _MIGRATIONS:
+        cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            conn.execute(ddl)
 
 
 @contextmanager

@@ -90,3 +90,51 @@ class TransportRejectError(InquiryError):
     """监管网关明确拒收（终态，不重试）。"""
 
     code = "TRANSPORT_REJECT"
+
+
+# ---------------------------------------------------------------------------
+# 分区写作 / 最小披露权限
+# ---------------------------------------------------------------------------
+class AuthorizationError(InquiryError):
+    """分区授权相关拒绝的基类。"""
+
+    code = "AUTHORIZATION_ERROR"
+
+
+class InvalidActorError(AuthorizationError):
+    """缺少/空白/非法身份（绝不把缺失身份静默当成某个撰写人）。"""
+
+    code = "INVALID_ACTOR"
+
+
+class NotEnrolledError(AuthorizationError):
+    """问询未启用分区授权（legacy 宽松路径）或当事人不在问询成员名单内。"""
+
+    code = "NOT_ENROLLED"
+
+
+class ForbiddenError(AuthorizationError):
+    """读取/写入越权：当事人不是负责人也不是该问题的在列撰写人，
+    或尝试引用/下载未获准的资料类别/字段/附件。
+
+    拒绝响应只携带问题/章节/被拒资料的 *标识*（引用锚、类别、附件 id），
+    绝不回显受保护内容或新证据。
+    """
+
+    code = "FORBIDDEN"
+
+
+class StaleAuthzRevisionError(AuthorizationError):
+    """页面携带的授权修订号已失效（转派/离组/收紧后旧号保存）。
+
+    详情只给出当前修订号；不返回任何新证据内容。
+    """
+
+    code = "STALE_AUTHZ_REVISION"
+
+
+class AuthzConflictError(AuthorizationError):
+    """授权变更冲突：未知问题、自相矛盾的授权请求（既收紧又放宽）、
+    撰写人不是在册成员、类别非法、预期修订号不匹配等。"""
+
+    code = "AUTHZ_CONFLICT"

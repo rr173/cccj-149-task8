@@ -184,6 +184,51 @@ def main() -> None:
     print("  事件序列:")
     for t in dict.fromkeys(types):
         print("   -", t)
+
+    # 15) 分区写作与最小披露权限（独立问询演示，不影响上面的封存链）
+    step("15. 分区授权：最小披露上下文 / 授权号失效 / 越权留痕")
+    inq2 = o.register_inquiry(
+        regulator="NMPA", jurisdiction="CN", title="分区问询",
+        questions=[{"qid": "Q1", "text": "病例转归？"},
+                   {"qid": "Q2", "text": "法规依据？"}],
+        deadline="2026-10-20T00:00:00+00:00",
+        allowed_material_ids=["CASE-7788", "RULE-EXP", "STAT-2026Q3"],
+        registered_by="intake-desk")
+    d2 = o.lock_draft(
+        inq2["id"],
+        ["CASE:CASE-7788@1", "REG:RULE-EXP@2026-1", "STAT:STAT-2026Q3@3"],
+        created_by="lead")
+    o.enroll_authz(inq2["id"], lead="lead", writers=["alice", "bob"], grants={
+        "Q1": {"categories": ["CASE"], "fields": ["outcome"],
+               "writers": ["alice"]},
+        "Q2": {"categories": ["REGULATION"], "fields": ["*"],
+               "writers": ["bob"]}})
+    print("  授权修订号:", o.authz_revision(inq2["id"]))
+    ctx = o.read_section_context(d2["id"], "Q1", actor="alice")
+    print("  alice 可见证据:", [e["ref"] for e in ctx["evidence"]],
+          "（REG/STAT 不出现）")
+    print("  病例投影:", ctx["evidence"][0]["content"],
+          "（姓名等已替换为稳定占位符）")
+    try:
+        o.read_section_context(d2["id"], "Q1", actor="bob")
+    except Exception as e:
+        print("  bob 读 Q1 ->", e.code)
+    # 收紧授权 -> 旧授权修订号立即失效
+    o.set_question_policy(inq2["id"], "Q1", categories=[], fields=[],
+                          writers=["alice"], expected_revision=1,
+                          updated_by="lead")
+    try:
+        o.submit_section(d2["id"], "Q1", "旧号保存 [CASE:CASE-7788@1]",
+                         expected_revision=0, submitted_by="alice",
+                         expected_authz_revision=1)
+    except Exception as e:
+        print("  收紧后旧号保存 ->", e.code, "（响应只给当前号",
+              e.details["current"], "，无新证据）")
+    cf = o.authz_conflicts(inquiry_id=inq2["id"])
+    print("  授权冲突留痕:", cf["count"], "条（只含问题/资料标识，无正文）")
+    va = o.verify_authz(inquiry_id=inq2["id"])
+    print("  授权独立核验 ok =", va["ok"])
+
     print("\n演示数据库目录:", d)
 
 

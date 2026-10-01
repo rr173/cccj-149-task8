@@ -17,6 +17,7 @@ import threading
 from typing import Any, Callable
 
 from . import audit, db as dbmod, drafts, jobs, materials, submissions, validation
+from . import authz
 from .errors import JobFailed, TransportRejectError, TransportTempError
 from .transport import RegulatorTransport
 from .util import Clock
@@ -150,25 +151,60 @@ class InquiryOrchestrator:
     # =======================================================================
     def submit_section(self, draft_id: str, qid: str, body: str, *,
                        expected_revision: int, title: str = "",
-                       submitted_by: str | None = None) -> dict:
-        """乐观并发提交。
+                       submitted_by: str | None = None,
+                       expected_authz_revision: int | None = None) -> dict:
+        """乐观并发提交（章节修订号 + 授权修订号双前提）。
 
-        过期提交不覆盖新内容；冲突留痕在独立事务中保留（业务事务回滚不影响
-        留痕），随后把 STALE_REVISION 抛给调用方。
+        - 过期章节修订号：不覆盖新内容；冲突留痕在独立事务中保留（业务
+          事务回滚不影响留痕），随后把 STALE_REVISION 抛给调用方；
+        - 过期/失效授权修订号（转派/离组/收紧后旧号）、非在册撰写人、
+          引用越权：拒绝保存，逐项越权写只增留痕（独立事务，不随业务
+          回滚丢失）；拒绝响应只含问题/章节/被拒资料标识，不含新证据；
+        - 转派与保存并发时 IMMEDIATE 写锁串行，两个前提共同保证唯一结果。
         """
-        from .errors import StaleRevisionError
+        from .errors import (ForbiddenError, InvalidActorError, NotEnrolledError,
+                             StaleAuthzRevisionError, StaleRevisionError)
+        authz_errors = (ForbiddenError, InvalidActorError, NotEnrolledError,
+                        StaleAuthzRevisionError)
         with self._lock:
             c = self.conn()
             try:
                 with dbmod.transaction(c):
+                    draft = drafts.get_draft(c, draft_id, include=True)
+                    gate = None
+                    if authz.is_enrolled(c, draft["inquiry_id"]):
+                        gate = authz.check_section_save(
+                            c, draft, qid, actor=submitted_by,
+                            expected_authz_revision=expected_authz_revision,
+                            body=body)
                     return drafts.submit_section(
                         c, draft_id, qid, body, expected_revision=expected_revision,
-                        title=title, submitted_by=submitted_by)
+                        title=title, submitted_by=submitted_by,
+                        authz_revision=gate["authz_revision"] if gate else None)
             except StaleRevisionError:
                 with dbmod.transaction(c):
                     drafts.record_stale_conflict(
                         c, draft_id, qid, expected_revision, body, submitted_by)
                 raise
+            except authz_errors:
+                # 授权拒绝的留痕已随业务事务回滚丢失 -> 在独立事务重放，
+                # 保证“拒绝必留痕、且不回显受保护内容”同时成立。
+                with dbmod.transaction(c):
+                    self._rerun_save_denial(
+                        c, draft_id, qid, body=body, actor=submitted_by,
+                        expected_authz_revision=expected_authz_revision)
+                raise
+
+    def _rerun_save_denial(self, c, draft_id, qid, *, body, actor,
+                           expected_authz_revision):
+        """独立事务重放保存授权检查以持久化越权留痕（结果仍拒绝）。"""
+        draft = drafts.get_draft(c, draft_id, include=True)
+        try:
+            authz.check_section_save(
+                c, draft, qid, actor=actor,
+                expected_authz_revision=expected_authz_revision, body=body)
+        except Exception:
+            pass  # 留痕已落库；调用方随后抛出原异常
 
     def section_history(self, section_id: str) -> list[dict]:
         with self.conn() as c:
@@ -178,16 +214,242 @@ class InquiryOrchestrator:
                        content_type: str = "application/octet-stream",
                        derived_from_ref: str | None = None,
                        uploaded_by: str | None = None,
-                       attachment_id: str | None = None) -> dict:
-        with self._lock, self.conn() as c, dbmod.transaction(c):
-            return drafts.add_attachment(
-                c, draft_id, filename=filename, content=content,
-                content_type=content_type, derived_from_ref=derived_from_ref,
-                uploaded_by=uploaded_by, attachment_id=attachment_id)
+                       attachment_id: str | None = None,
+                       qid: str | None = None) -> dict:
+        """上传附件。
 
-    def get_attachment(self, draft_id: str, attachment_id: str) -> dict:
+        启用分区授权后：必须带 ``qid``（归属问题）；上传人须是该问题在列
+        撰写人且溯源类别获准；附件继承与章节读取相同的授权边界，下载时
+        按同一边界再校验。
+        """
+        from .errors import (AuthzConflictError, ForbiddenError,
+                             InvalidActorError, NotEnrolledError)
+        with self._lock:
+            c = self.conn()
+            try:
+                with dbmod.transaction(c):
+                    draft = drafts.get_draft(c, draft_id, include=True)
+                    gate = None
+                    if authz.is_enrolled(c, draft["inquiry_id"]):
+                        gate = authz.check_attachment_upload(
+                            c, draft, qid=qid,
+                            derived_from_ref=derived_from_ref,
+                            actor=uploaded_by)
+                        qid = gate["qid"]
+                    return drafts.add_attachment(
+                        c, draft_id, filename=filename, content=content,
+                        content_type=content_type,
+                        derived_from_ref=derived_from_ref,
+                        uploaded_by=uploaded_by,
+                        attachment_id=attachment_id, qid=qid,
+                        upload_authz_revision=gate["authz_revision"] if gate
+                        else None)
+            except (ForbiddenError, InvalidActorError, NotEnrolledError,
+                    AuthzConflictError):
+                with dbmod.transaction(c):
+                    self._rerun_upload_denial(
+                        c, draft_id, qid=qid, derived_from_ref=derived_from_ref,
+                        actor=uploaded_by)
+                raise
+
+    def _rerun_upload_denial(self, c, draft_id, *, qid, derived_from_ref, actor):
+        draft = drafts.get_draft(c, draft_id, include=True)
+        try:
+            authz.check_attachment_upload(
+                c, draft, qid=qid, derived_from_ref=derived_from_ref, actor=actor)
+        except Exception:
+            pass
+
+    def get_attachment(self, draft_id: str, attachment_id: str, *,
+                       actor: str | None = None) -> dict:
+        """下载附件：启用授权后按归属问题的当前授权边界校验（越权拒绝，
+        不返回内容；逐次越权写只增留痕）。"""
         with self.conn() as c:
-            return drafts.get_attachment_content(c, draft_id, attachment_id)
+            row = drafts.get_attachment_content(c, draft_id, attachment_id)
+            if actor is None:
+                return row
+            draft = drafts.get_draft(c, draft_id, include=True)
+            if not authz.is_enrolled(c, draft["inquiry_id"]):
+                return row
+            attach = next(a for a in draft["attachments"]
+                          if a["id"] == attachment_id)
+            try:
+                with dbmod.transaction(c):
+                    authz.check_attachment_download(c, draft, attach, actor=actor)
+            except Exception:
+                # 独立事务重放以持久化越权留痕（只记标识，不回显内容）
+                with dbmod.transaction(c):
+                    try:
+                        fresh = drafts.get_draft(c, draft_id, include=True)
+                        a2 = next(a for a in fresh["attachments"]
+                                  if a["id"] == attachment_id)
+                        authz.check_attachment_download(c, fresh, a2, actor=actor)
+                    except Exception:
+                        pass
+                raise
+            return row
+
+    # =======================================================================
+    # 3b) 分区写作 / 最小披露权限
+    # =======================================================================
+    def enroll_authz(self, inquiry_id: str, *, lead: str,
+                     writers: list[str] | None = None,
+                     grants: dict | None = None,
+                     idempotency_key: str | None = None,
+                     enrolled_by: str | None = None) -> dict:
+        """负责人启用分区授权（成员名册 + 逐问授权基线，修订号 1）。"""
+        with self._lock, self.conn() as c, dbmod.transaction(c):
+            return authz.enroll(
+                c, inquiry_id, lead=lead, writers=writers, grants=grants,
+                enrolled_by=enrolled_by, idempotency_key=idempotency_key)
+
+    def set_question_policy(self, inquiry_id: str, qid: str, *,
+                            categories: list[str], fields: list[str],
+                            writers: list[str],
+                            expected_revision: int | None = None,
+                            updated_by: str, reason: str = "",
+                            idempotency_key: str | None = None) -> dict:
+        """负责人设置某问题的可见资料类别/可见字段/撰写人名单。
+
+        相同授权请求不推进修订号、不增加权限、不重复留痕；实质变化
+        （含收紧、放宽、转派）原子推进授权修订号，使所有旧页面号失效。
+        """
+        with self._lock, self.conn() as c, dbmod.transaction(c):
+            return authz.put_question_policy(
+                c, inquiry_id, qid, categories=categories, fields=fields,
+                writers=writers, expected_revision=expected_revision,
+                updated_by=updated_by, reason=reason,
+                idempotency_key=idempotency_key)
+
+    def add_writers(self, inquiry_id: str, writers: list[str], *,
+                    updated_by: str, reason: str = "",
+                    idempotency_key: str | None = None) -> dict:
+        with self._lock, self.conn() as c, dbmod.transaction(c):
+            return authz.set_members(
+                c, inquiry_id, writers=writers, action="ADD",
+                updated_by=updated_by, reason=reason,
+                idempotency_key=idempotency_key)
+
+    def remove_writers(self, inquiry_id: str, writers: list[str], *,
+                       updated_by: str, reason: str = "",
+                       idempotency_key: str | None = None) -> dict:
+        """人员离组：立即推进授权修订号，其名下页面旧号全部失效。"""
+        with self._lock, self.conn() as c, dbmod.transaction(c):
+            return authz.set_members(
+                c, inquiry_id, writers=writers, action="REMOVE",
+                updated_by=updated_by, reason=reason,
+                idempotency_key=idempotency_key)
+
+    def reactivate_writers(self, inquiry_id: str, writers: list[str], *,
+                           updated_by: str, reason: str = "",
+                           idempotency_key: str | None = None) -> dict:
+        with self._lock, self.conn() as c, dbmod.transaction(c):
+            return authz.set_members(
+                c, inquiry_id, writers=writers, action="REACTIVATE",
+                updated_by=updated_by, reason=reason,
+                idempotency_key=idempotency_key)
+
+    def transfer_lead(self, inquiry_id: str, *, new_lead: str,
+                      updated_by: str, reason: str = "",
+                      idempotency_key: str | None = None) -> dict:
+        """负责人转派：旧页面授权修订号立即失效（只一个结果）。"""
+        with self._lock, self.conn() as c, dbmod.transaction(c):
+            return authz.transfer_lead(
+                c, inquiry_id, new_lead=new_lead, updated_by=updated_by,
+                reason=reason, idempotency_key=idempotency_key)
+
+    def list_members(self, inquiry_id: str, *, active_only: bool = False) -> list[dict]:
+        with self.conn() as c:
+            return authz.list_members(c, inquiry_id, active_only=active_only)
+
+    def get_question_policy(self, inquiry_id: str, qid: str) -> dict | None:
+        with self.conn() as c:
+            return authz.current_grant(c, inquiry_id, qid)
+
+    def list_question_policies(self, inquiry_id: str) -> list[dict]:
+        with self.conn() as c:
+            return authz.list_current_grants(c, inquiry_id)
+
+    def authz_revision(self, inquiry_id: str) -> int:
+        with self.conn() as c:
+            return authz.current_revision(c, inquiry_id)
+
+    def read_section_context(self, draft_id: str, qid: str, *,
+                             actor: str) -> dict:
+        """受限上下文读取：只返回获准的证据片段（未获准字段稳定占位）。
+
+        负责人可见全量；撰写人按该问题当前授权投影；越权读取抛 FORBIDDEN
+        且只增留痕，响应中不出现被拒资料。
+        """
+        from .errors import (ForbiddenError, InvalidActorError,
+                             NotEnrolledError)
+        with self._lock:
+            c = self.conn()
+            try:
+                with dbmod.transaction(c):
+                    return authz.read_section_context(c, draft_id, qid, actor=actor)
+            except (ForbiddenError, InvalidActorError, NotEnrolledError):
+                # 业务事务回滚 -> 独立事务补写越权留痕（只记标识）
+                with dbmod.transaction(c):
+                    try:
+                        draft = drafts.get_draft(c, draft_id, include=False)
+                        if authz.is_enrolled(c, draft["inquiry_id"]):
+                            from .identity import validate_identity
+                            try:
+                                key = validate_identity(actor)
+                            except ValueError:
+                                key = None
+                            if key is not None:
+                                authz.record_denial(
+                                    c, draft["inquiry_id"],
+                                    action="READ_CONTEXT", draft_id=draft_id,
+                                    qid=qid, actor_key=key, code="FORBIDDEN",
+                                    authz_revision=authz.current_revision(
+                                        c, draft["inquiry_id"]),
+                                    detail="不是该问题的在列撰写人")
+                    except Exception:
+                        pass
+                raise
+
+    def requalify_attachment(self, draft_id: str, attachment_id: str, qid: str, *,
+                             actor: str,
+                             idempotency_key: str | None = None) -> dict:
+        """克隆（候选/更正）附件在当前授权下重新认定。"""
+        with self._lock, self.conn() as c, dbmod.transaction(c):
+            return authz.requalify_attachment(
+                c, draft_id, attachment_id, qid, actor=actor,
+                idempotency_key=idempotency_key)
+
+    def authz_conflicts(self, *, inquiry_id: str | None = None,
+                        draft_id: str | None = None, qid: str | None = None,
+                        action: str | None = None) -> dict:
+        """授权冲突查询：越权留痕（保存/上传/下载/读取/定稿复核）。
+
+        只含问题、章节与被拒资料的标识（引用锚/类别/附件 id），
+        绝不回显受保护内容。
+        """
+        with self.conn() as c:
+            denials = authz.list_denials(
+                c, inquiry_id=inquiry_id, draft_id=draft_id, qid=qid,
+                action=action)
+            return {"denials": denials, "count": len(denials)}
+
+    def authz_history(self, inquiry_id: str, *, qid: str | None = None,
+                      limit: int | None = None) -> list[dict]:
+        """授权变更历史（启用/名册/转派/逐问政策/再认定/拒绝）。"""
+        with self.conn() as c:
+            return authz.change_history(c, inquiry_id, qid=qid, limit=limit)
+
+    def grant_history(self, inquiry_id: str, qid: str) -> list[dict]:
+        with self.conn() as c:
+            return authz.grant_history(c, inquiry_id, qid)
+
+    def verify_authz(self, *, inquiry_id: str | None = None) -> dict:
+        """授权独立核验（不复用组装/校验路径，逐行重放）。"""
+        from .authz_verifier import verify_authz
+        with self.conn() as c:
+            return verify_authz(c, inquiry_id=inquiry_id)
+
 
     # =======================================================================
     # 4) 冲突查询

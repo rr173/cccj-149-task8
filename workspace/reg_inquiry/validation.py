@@ -119,6 +119,7 @@ def _is_redaction(v) -> bool:
 
 def build_report(conn, draft_id: str) -> dict:
     """组装完整校验报告（只读）。"""
+    from . import authz
     draft = drafts.get_draft(conn, draft_id)
     inquiry = drafts.get_inquiry(conn, draft["inquiry_id"])
     policy = materials.current_policy(conn, inquiry["jurisdiction"])
@@ -143,6 +144,20 @@ def build_report(conn, draft_id: str) -> dict:
                                f"{c['value_a']!r} ≠ {c['value_b']!r}",
                                fact_key=c["fact_key"], ref_a=c["ref_a"],
                                ref_b=c["ref_b"]))
+
+    # 1b) 分区授权：逐问确认每次引用/附件上传时都具有读取资格（as-of + 当前）。
+    # 越权条目只带问题/章节/被拒资料标识，绝不回显受保护内容；并把每项写入
+    # 只增 authz_denials（FINALIZE_CHECK 动作）供审计。
+    authz_issues = authz.finalize_authz_checks(conn, draft)
+    for it in authz_issues:
+        blocking.append(it)
+        authz.record_denial(
+            conn, draft["inquiry_id"], action="FINALIZE_CHECK",
+            draft_id=draft_id, qid=it.get("qid"), section_id=it.get("section_id"),
+            code=it["code"], denied_ref=it.get("denied_ref"),
+            category=it.get("category"), attachment_id=it.get("attachment_id"),
+            authz_revision=authz.current_revision(conn, draft["inquiry_id"]),
+            detail=it.get("message", "")[:200])
 
     # 2) 逐问题：唯一章节 / 非空回答 / 引用全部锁定且版本一致 / 敏感合规
     for q in inquiry["questions"]:
@@ -252,6 +267,19 @@ def build_report(conn, draft_id: str) -> dict:
                                    f"章节 {s['qid']} 不对应问询清单中的任何问题",
                                    qid=s["qid"]))
 
+    # 4b) 授权越权项归入逐问视图与未满足清单（只列标识，不回显内容）
+    authz_by_qid: dict[str, list] = {}
+    for it in authz_issues:
+        authz_by_qid.setdefault(it.get("qid"), []).append(it)
+        unsatisfied.append({"qid": it.get("qid"), "code": it["code"],
+                            "message": it.get("message", ""),
+                            "denied_ref": it.get("denied_ref"),
+                            "category": it.get("category"),
+                            "attachment_id": it.get("attachment_id")})
+        pq = per_question.setdefault(it.get("qid"),
+                                     {"qid": it.get("qid"), "issues": []})
+        pq["issues"].append(it)
+
     # 5) 漂移 / 截止时间 警告（非阻断）
     warnings.extend(check_drift(conn, draft))
     try:
@@ -268,6 +296,8 @@ def build_report(conn, draft_id: str) -> dict:
         "inquiry_id": draft["inquiry_id"],
         "jurisdiction": inquiry["jurisdiction"],
         "policy_version": policy.get("version"),
+        "authz_revision": authz.current_revision(conn, draft["inquiry_id"]),
+        "authz_enforced": authz.is_enrolled(conn, draft["inquiry_id"]),
         "ok": not blocking,
         "blocking": blocking,
         "warnings": warnings,

@@ -285,28 +285,33 @@ def _clone_sections_and_attachments(conn, src_draft_id: str, dst_draft_id: str,
         # 新底稿沿用来源当前修订号：克隆内容就是调用方“看到的修订”，
         # 首次提交必须带 expected_revision=该修订号（与来源当前版本一致），
         # 历史修订原样复制，新版本号在其之后递增，无重号。
+        # 分区授权：新底稿的当前章节 authz_revision 置 NULL（继承内容必须由
+        # 合格撰写人在当前授权下重新保存才能定稿）；历史修订保留原号，
+        # 供审计与 as-of 核验重放。
         conn.execute(
-            "INSERT INTO sections(id,draft_id,qid,title,body,revision,updated_by,"
-            "updated_at) VALUES(?,?,?,?,?,?,?,?)",
+            "INSERT INTO sections(id,draft_id,qid,title,body,revision,authz_revision,"
+            "updated_by,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
             (nsid, dst_draft_id, s["qid"], s["title"], s["body"], s["revision"],
-             actor, now))
+             None, actor, now))
         for rv in history:
             conn.execute(
                 "INSERT INTO section_revisions(id,section_id,revision,body,title,"
-                "submitted_by,submitted_at) VALUES(?,?,?,?,?,?,?)",
+                "authz_revision,submitted_by,submitted_at) VALUES(?,?,?,?,?,?,?,?)",
                 (uuid.uuid4().hex, nsid, rv["revision"], rv["body"], rv["title"],
-                 rv["submitted_by"], rv["submitted_at"]))
+                 rv["authz_revision"], rv["submitted_by"], rv["submitted_at"]))
         # 克隆附件：附件锚 id（filename 之外的稳定 id）保留，便于正文引用延续
     for a in conn.execute("SELECT * FROM attachments WHERE draft_id=? ORDER BY rowid",
                           (src_draft_id,)):
         derived = a["derived_from_ref"]
         if ref_remap and derived in ref_remap:
             derived = ref_remap[derived]
+        # 分区授权：附件在新底稿必须重新认定（upload_authz_revision=NULL），
+        # 归属问题 qid 随克隆保留，再认定按该问题的当前授权边界检查。
         conn.execute(
-            "INSERT INTO attachments(id,draft_id,filename,content_type,content_blob,"
-            "sha256,derived_from_ref,uploaded_by,created_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?)",
-            (a["id"], dst_draft_id, a["filename"], a["content_type"],
+            "INSERT INTO attachments(id,draft_id,qid,filename,content_type,"
+            "content_blob,sha256,derived_from_ref,upload_authz_revision,"
+            "uploaded_by,created_at) VALUES(?,?,?,?,?,?,?,?,NULL,?,?)",
+            (a["id"], dst_draft_id, a["qid"], a["filename"], a["content_type"],
              a["content_blob"], a["sha256"], derived, actor, now))
 
 
@@ -443,11 +448,15 @@ def submit_section(conn, draft_id: str, qid: str, body: str, *,
                    expected_revision: int, title: str = "",
                    submitted_by: str | None = None,
                    created_at: str | None = None,
-                   section_id: str | None = None) -> dict:
+                   section_id: str | None = None,
+                   authz_revision: int | None = None) -> dict:
     """提交章节内容。
 
     前提：expected_revision 必须等于调用方看到的当前修订号；
     过期提交不覆盖新内容，落冲突记录并抛 STALE_REVISION。
+
+    ``authz_revision``：分区授权启用后本次写入所依据的授权修订号
+    （授权闸门已在调用方校验）；克隆继承的历史修订为 NULL。
     """
     draft = get_draft(conn, draft_id, include=False)
     if draft["status"] != "OPEN":
@@ -468,17 +477,20 @@ def submit_section(conn, draft_id: str, qid: str, body: str, *,
                 details={"qid": qid, "expected": expected_revision, "actual": 0})
         sid = section_id or uuid.uuid4().hex
         conn.execute(
-            "INSERT INTO sections(id,draft_id,qid,title,body,revision,updated_by,"
-            "updated_at) VALUES(?,?,?,?,?,1,?,?)",
-            (sid, draft_id, qid, title, body, submitted_by, now))
+            "INSERT INTO sections(id,draft_id,qid,title,body,revision,authz_revision,"
+            "updated_by,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (sid, draft_id, qid, title, body, 1, authz_revision,
+             submitted_by, now))
         conn.execute(
             "INSERT INTO section_revisions(id,section_id,revision,body,title,"
-            "submitted_by,submitted_at) VALUES(?,?,1,?,?,?,?)",
-            (uuid.uuid4().hex, sid, body, title, submitted_by, now))
+            "authz_revision,submitted_by,submitted_at) VALUES(?,?,1,?,?,?,?,?)",
+            (uuid.uuid4().hex, sid, body, title, authz_revision,
+             submitted_by, now))
         audit.append_event(conn, "SECTION_SUBMITTED",
                            f"章节创建 {qid}（rev=1）",
                            payload={"draft_id": draft_id, "qid": qid,
-                                    "revision": 1, "length": len(body)},
+                                    "revision": 1, "length": len(body),
+                                    "authz_revision": authz_revision},
                            actor=submitted_by, inquiry_id=draft["inquiry_id"],
                            draft_id=draft_id, created_at=now)
         return dict(conn.execute("SELECT * FROM sections WHERE id=?",
@@ -493,17 +505,20 @@ def submit_section(conn, draft_id: str, qid: str, body: str, *,
 
     new_rev = s["revision"] + 1
     conn.execute(
-        "UPDATE sections SET title=?, body=?, revision=?, updated_by=?, updated_at=?"
-        " WHERE id=? AND revision=?",
-        (title, body, new_rev, submitted_by, now, s["id"], expected_revision))
+        "UPDATE sections SET title=?, body=?, revision=?, authz_revision=?, "
+        "updated_by=?, updated_at=? WHERE id=? AND revision=?",
+        (title, body, new_rev, authz_revision, submitted_by, now,
+         s["id"], expected_revision))
     conn.execute(
         "INSERT INTO section_revisions(id,section_id,revision,body,title,"
-        "submitted_by,submitted_at) VALUES(?,?,?,?,?,?,?)",
-        (uuid.uuid4().hex, s["id"], new_rev, body, title, submitted_by, now))
+        "authz_revision,submitted_by,submitted_at) VALUES(?,?,?,?,?,?,?,?)",
+        (uuid.uuid4().hex, s["id"], new_rev, body, title, authz_revision,
+         submitted_by, now))
     audit.append_event(conn, "SECTION_SUBMITTED",
                        f"章节更新 {qid}（rev={new_rev}）",
                        payload={"draft_id": draft_id, "qid": qid,
-                                "revision": new_rev, "length": len(body)},
+                                "revision": new_rev, "length": len(body),
+                                "authz_revision": authz_revision},
                        actor=submitted_by, inquiry_id=draft["inquiry_id"],
                        draft_id=draft_id, created_at=now)
     return dict(conn.execute("SELECT * FROM sections WHERE id=?",
@@ -542,7 +557,9 @@ def add_attachment(conn, draft_id: str, *, filename: str, content: bytes,
                    derived_from_ref: str | None = None,
                    uploaded_by: str | None = None,
                    created_at: str | None = None,
-                   attachment_id: str | None = None) -> dict:
+                   attachment_id: str | None = None,
+                   qid: str | None = None,
+                   upload_authz_revision: int | None = None) -> dict:
     draft = get_draft(conn, draft_id, include=False)
     if draft["status"] != "OPEN":
         raise DraftSealedError(f"底稿 {draft_id} 已{draft['status']}，不可新增附件")
@@ -561,27 +578,29 @@ def add_attachment(conn, draft_id: str, *, filename: str, content: bytes,
     aid = attachment_id or uuid.uuid4().hex
     digest = sha256_raw(content)
     conn.execute(
-        "INSERT INTO attachments(id,draft_id,filename,content_type,content_blob,"
-        "sha256,derived_from_ref,uploaded_by,created_at)"
-        " VALUES(?,?,?,?,?,?,?,?,?)",
-        (aid, draft_id, filename, content_type, bytes(content), digest,
-         derived_from_ref, uploaded_by, now))
+        "INSERT INTO attachments(id,draft_id,qid,filename,content_type,content_blob,"
+        "sha256,derived_from_ref,upload_authz_revision,uploaded_by,created_at)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        (aid, draft_id, qid, filename, content_type, bytes(content), digest,
+         derived_from_ref, upload_authz_revision, uploaded_by, now))
     audit.append_event(conn, "ATTACHMENT_ADDED",
                        f"附件上传 {filename}（{len(content)} 字节）",
                        payload={"draft_id": draft_id, "filename": filename,
                                 "attachment_id": aid, "sha256": digest,
-                                "derived_from_ref": derived_from_ref},
+                                "derived_from_ref": derived_from_ref, "qid": qid,
+                                "upload_authz_revision": upload_authz_revision},
                        actor=uploaded_by, inquiry_id=draft["inquiry_id"],
                        draft_id=draft_id, created_at=now)
-    return dict(conn.execute("SELECT id,draft_id,filename,content_type,sha256,"
-                             "derived_from_ref,uploaded_by,created_at,"
-                             "length(content_blob) AS size FROM attachments WHERE id=?",
-                             (aid,)).fetchone())
+    return dict(conn.execute("SELECT id,draft_id,qid,filename,content_type,sha256,"
+                             "derived_from_ref,upload_authz_revision,uploaded_by,"
+                             "created_at,length(content_blob) AS size FROM attachments "
+                             "WHERE id=?", (aid,)).fetchone())
 
 
 def list_attachments(conn, draft_id: str, *, with_content: bool = False) -> list[dict]:
-    cols = ("id,draft_id,filename,content_type,sha256,derived_from_ref,uploaded_by,"
-            "created_at,length(content_blob) AS size")
+    cols = ("id,draft_id,qid,filename,content_type,sha256,derived_from_ref,"
+            "upload_authz_revision,uploaded_by,created_at,"
+            "length(content_blob) AS size")
     rows = conn.execute(
         f"SELECT {cols}{', content_blob' if with_content else ''} FROM attachments "
         "WHERE draft_id=? ORDER BY filename", (draft_id,)).fetchall()

@@ -25,6 +25,14 @@ def _answer_uid(draft_id: str, qid: str, section_id: str, revision: int) -> str:
     return sha256_hex([draft_id, qid, section_id, revision])[:20]
 
 
+def _draft_authz_revision(conn, inquiry_id: str) -> int:
+    """封存时的授权修订号（未启用分区授权为 0）；封存后人员/权限变化
+    不会也不可能改写本提交件——manifest 固定的就是封存时点的号。"""
+    r = conn.execute("SELECT authz_revision FROM inquiry_authz WHERE inquiry_id=?",
+                     (inquiry_id,)).fetchone()
+    return r["authz_revision"] if r else 0
+
+
 def build_manifest(conn, draft: dict, *, submission_id: str, kind: str,
                    corrects_submission_id: str | None, outgoing_number: str,
                    sealed_at: str, policy_version: int | None) -> dict:
@@ -45,14 +53,18 @@ def build_manifest(conn, draft: dict, *, submission_id: str, kind: str,
                                       sec["revision"]),
             "section_id": sec["id"],
             "section_revision": sec["revision"],
+            "authz_revision": sec["authz_revision"],
             "title": sec["title"],
             "body_sha256": sha256_hex(sec["body"]),
             "citations": cite_refs,
             "attachments": [{
                 "attachment_id": aid,
+                "qid": attach_by_id[aid].get("qid"),
                 "filename": attach_by_id[aid]["filename"],
                 "sha256": attach_by_id[aid]["sha256"],
                 "derived_from_ref": attach_by_id[aid]["derived_from_ref"],
+                "upload_authz_revision":
+                    attach_by_id[aid].get("upload_authz_revision"),
             } for aid in sorted(set(attach_refs)) if aid in attach_by_id],
         })
     return {
@@ -63,6 +75,7 @@ def build_manifest(conn, draft: dict, *, submission_id: str, kind: str,
         "outgoing_number": outgoing_number,
         "sealed_at": sealed_at,
         "policy_version": policy_version,
+        "authz_revision": _draft_authz_revision(conn, draft["inquiry_id"]),
         "pins": sorted([{
             "ref": p["ref"], "material_id": p["material_id"],
             "version": p["version"], "category": p["category"],
